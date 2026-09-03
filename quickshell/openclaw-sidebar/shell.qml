@@ -722,6 +722,10 @@ ShellRoot {
                         color: root.colSubtle
                         font.pixelSize: 12
                         font.italic: true
+                        // Show up to 3 wrapped lines (was 1 elided line) so long
+                        // bash commands / status text are actually readable.
+                        wrapMode: Text.Wrap
+                        maximumLineCount: 3
                         elide: Text.ElideRight
                         verticalAlignment: Text.AlignVCenter
                     }
