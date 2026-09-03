@@ -528,18 +528,6 @@ ShellRoot {
                             contentItem: Label { text: parent.text; color: root.colSubtle; font.pixelSize: 15; horizontalAlignment: Text.AlignHCenter }
                             background: Rectangle { color: parent.hovered ? root.colBorder : "transparent"; radius: 6 }
                         }
-                        // pop the same conversation out to a terminal (CLI), then hide the flyout
-                        ToolButton {
-                            text: "↗"
-                            onClicked: {
-                                Quickshell.execDetached(["alacritty", "--title", "OpenClaw", "-e",
-                                                         (Quickshell.env("HOME") || "") + "/.local/bin/openclaw-cli-chat.sh"]);
-                                root.shown = false;
-                            }
-                            ToolTip.text: "Continue in terminal (CLI)"; ToolTip.visible: hovered
-                            contentItem: Label { text: parent.text; color: root.colSubtle; font.pixelSize: 16; horizontalAlignment: Text.AlignHCenter }
-                            background: Rectangle { color: parent.hovered ? root.colBorder : "transparent"; radius: 6 }
-                        }
                         // collapse: tuck the flyout away (reopens on the same chat; stays pinned so re-show reserves space)
                         // ❮ (U+276E) renders visually chunkier than the ↗ arrow at the same
                         // pixelSize, so use 13 (not 16) to make the chevron LOOK the same size.
@@ -547,6 +535,19 @@ ShellRoot {
                             text: "❮"
                             onClicked: root.shown = false
                             ToolTip.text: "Collapse (reopen with the toggle)"; ToolTip.visible: hovered
+                            contentItem: Label { text: parent.text; color: root.colSubtle; font.pixelSize: 13; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
+                            background: Rectangle { color: parent.hovered ? root.colBorder : "transparent"; radius: 6 }
+                        }
+                        // pop the same conversation out to a terminal (CLI), then hide the flyout
+                        // ❯ (U+276F) matches the ❮ collapse chevron; pixelSize 13 keeps them the same visual size.
+                        ToolButton {
+                            text: "❯"
+                            onClicked: {
+                                Quickshell.execDetached(["alacritty", "--title", "OpenClaw", "-e",
+                                                         (Quickshell.env("HOME") || "") + "/.local/bin/openclaw-cli-chat.sh"]);
+                                root.shown = false;
+                            }
+                            ToolTip.text: "Continue in terminal (CLI)"; ToolTip.visible: hovered
                             contentItem: Label { text: parent.text; color: root.colSubtle; font.pixelSize: 13; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter }
                             background: Rectangle { color: parent.hovered ? root.colBorder : "transparent"; radius: 6 }
                         }
