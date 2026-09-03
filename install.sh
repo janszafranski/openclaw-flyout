@@ -61,7 +61,7 @@ if [[ "$DE" == hyprland ]]; then
   LUA="$HOME/.config/hypr/hyprland.lua"
   MARK_A="-- >>> openclaw-flyout >>>"
   MARK_B="-- <<< openclaw-flyout <<<"
-  if [[ -f "$LUA" ]] && grep -q "hl\." "$LUA" && ! grep -qF "$MARK_A" "$LUA"; then
+  if [[ -f "$LUA" ]] && grep -q "hl\." "$LUA" && ! grep -qF -e "$MARK_A" "$LUA"; then
     log "Adding Super+O toggle, autostart and blur rule to hyprland.lua"
     cat >> "$LUA" <<EOF
 
