@@ -193,6 +193,7 @@ ShellRoot {
                     "content": exitCode === 0 ? "(no reply)"
                         : "**Can't reach the bridge.** Is `openclaw-ai-bridge.service` running? (curl exit " + exitCode + ")" });
             root.loadSessions();   // refresh recent-chats
+            settleTimer.restart(); // hold the history poll off until the turn flushes
             root.pumpQueue();      // send next queued message, if any
         }
     }
@@ -224,9 +225,24 @@ ShellRoot {
     Timer {
         id: refreshTimer
         interval: 3000; repeat: true
-        running: root.shown            // auto start/stop with panel visibility
+        running: root.shown && !root.busy && !settleTimer.running
+                                            // pause while a turn streams: the poll
+                                            // reads SQLite, which lacks the in-progress
+                                            // reply (written only on completion), so a
+                                            // mid-turn poll would clear()+refill and
+                                            // wipe the streamed text — the flicker.
+                                            // settleTimer holds the poll off briefly
+                                            // after a turn so the just-finished reply
+                                            // has flushed to SQLite before we diff.
         triggeredOnStart: true         // reload immediately on show, then every 3s
         onTriggered: root.loadHistory(root.currentSession)
+    }
+    // After a streamed turn ends, wait for the gateway to flush it to SQLite before
+    // re-enabling the poll — otherwise the first post-turn diff wipes the reply that
+    // the stream just rendered. Started from chatProc.onExited.
+    Timer {
+        id: settleTimer
+        interval: 4000; repeat: false; running: false
     }
 
     IpcHandler {
