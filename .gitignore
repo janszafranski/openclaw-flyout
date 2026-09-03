@@ -1,0 +1,20 @@
+# user-generated / runtime
+shortcuts.json
+*.log
+
+# build / packaging artifacts
+*.pkg.tar.zst
+*.tar.gz
+packaging/aur/src/
+packaging/aur/pkg/
+
+# editor / OS cruft
+__pycache__/
+*.pyc
+*.swp
+.DS_Store
+
+# stray backups (never commit *.GOOD-* snapshots)
+*.GOOD-*
+*.bak
+*.orig

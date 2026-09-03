@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenClaw AI bridge (OpenAI-compatible endpoint for the AI flyout)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.local/bin/openclaw-ai-bridge.js
+Restart=on-failure
+RestartSec=3
+Environment=OPENCLAW_BRIDGE_PORT=8787
+Environment=OPENCLAW_BRIDGE_TIMEOUT=600
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+{
+  "_comment": "Example launcher bar. On first run the panel auto-seeds a similar set with absolute icon paths under ~/.config/quickshell/openclaw-sidebar/icons/. Edit via the + button or by hand. 'terminal': true draws the icon in a console box; 'cmd' runs via sh -lc.",
+  "shortcuts": [
+    { "label": "Claude GUI",  "cmd": "xdg-open https://claude.ai",              "icon": "~/.config/quickshell/openclaw-sidebar/icons/claude.svg", "terminal": false },
+    { "label": "ChatGPT GUI", "cmd": "xdg-open https://chatgpt.com",            "icon": "~/.config/quickshell/openclaw-sidebar/icons/openai.svg", "terminal": false },
+    { "label": "NotebookLM",  "cmd": "xdg-open https://notebooklm.google.com",  "icon": "~/.config/quickshell/openclaw-sidebar/icons/gemini.svg", "terminal": false },
+    { "label": "Claude CLI",  "cmd": "kitty claude",                            "icon": "~/.config/quickshell/openclaw-sidebar/icons/claude.svg", "terminal": true },
+    { "label": "AskGPT CLI",  "cmd": "kitty tgpt -i",                           "icon": "~/.config/quickshell/openclaw-sidebar/icons/openai.svg", "terminal": true }
+  ]
+}
