@@ -2,7 +2,7 @@
 
 <p align="center"><img src="assets/screenshot.png" alt="OpenClaw flyout side panel" width="320"></p>
 
-A pinnable **Quickshell** side panel that chats with your [OpenClaw](https://openclaw.ai)
+Arch linux pinnable **Quickshell** side panel that chats with your [OpenClaw](https://openclaw.ai)
 agent, backed by a tiny local **OpenAI-compatible bridge** on `127.0.0.1:8787`.
 
 Toggle it with **Super+O**. It docks to the left edge, reserves screen space when
