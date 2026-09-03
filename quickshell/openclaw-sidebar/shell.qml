@@ -321,6 +321,17 @@ ShellRoot {
                     var m = d.messages[i];
                     next.push({ "role": m.role, "content": m.content });
                 }
+                // NEVER clobber optimistic local state with a lagging store. The
+                // gateway writes a turn to SQLite only on completion, so between
+                // "user hits send" and "reply flushed" the store has FEWER messages
+                // than we're showing (the just-typed prompt + streaming reply live
+                // only in chatModel). Applying that snapshot would clear() them —
+                // that's why the question AND the prior reply vanished. So bail while
+                // a turn is in flight, and never shrink: only adopt the store when it
+                // has caught up (>= what we show). A genuine session SWITCH clears the
+                // model first, so count 0 there still loads fine.
+                if (root.busy) return;
+                if (next.length < chatModel.count) return;
                 var changed = (next.length !== chatModel.count);
                 if (!changed) {
                     for (var j = 0; j < next.length; j++) {
