@@ -31,7 +31,7 @@ command -v openclaw >/dev/null 2>&1 || warn "The 'openclaw' CLI is not on PATH â
 # --- deploy ------------------------------------------------------------------
 log "Deploying bridge, panel and helper scripts"
 install -Dm755 "$SELF/bin/openclaw-ai-bridge.js" "$HOME/.local/bin/openclaw-ai-bridge.js"
-for f in openclaw-cli-chat.sh openclaw-dashboard.sh; do
+for f in openclaw-cli-chat.sh openclaw-dashboard.sh start-openclaw-sidebar.sh; do
   [[ -f "$SELF/bin/$f" ]] && install -Dm755 "$SELF/bin/$f" "$HOME/.local/bin/$f"
 done
 mkdir -p "$HOME/.config/quickshell/openclaw-sidebar"
@@ -66,7 +66,9 @@ if [[ "$DE" == hyprland ]]; then
     cat >> "$LUA" <<EOF
 
 $MARK_A
-hl.exec_cmd("qs -c openclaw-sidebar")
+-- Launch via a guard script (starts one panel; no-ops if already running) so a
+-- repeated hyprland.start fire can't spawn duplicate overlapping panels.
+hl.exec_cmd("bash $HOME/.local/bin/start-openclaw-sidebar.sh")
 hl.bind(mod .. " + O", hl.dsp.exec_cmd("qs -c openclaw-sidebar ipc call sidebar toggle"), { description = "OpenClaw flyout" })
 hl.layer_rule({ name = "openclaw-flyout-noblur", match = { namespace = "openclaw-sidebar" }, blur = false })
 $MARK_B
