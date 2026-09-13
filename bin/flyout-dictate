@@ -1,11 +1,45 @@
 #!/usr/bin/env bash
-# flyout-dictate — placeholder. The real version records from the default PipeWire
-# source and transcribes locally with whisper.cpp, printing each transcribed
-# utterance as one line on stdout. Until whisper.cpp is installed, this emits a
-# single notice line and exits so the mic toggle has something to talk to.
-if command -v whisper-cli >/dev/null 2>&1 || test -x "$HOME/.local/share/whisper.cpp/main"; then
-  # (real path gets wired here once whisper.cpp is installed)
-  echo "[dictation backend not configured yet]"
-else
-  echo "[voice input not set up yet — ask OpenClaw to install whisper.cpp]"
+# flyout-dictate — local push-to-talk dictation for the OpenClaw flyout mic button.
+# While running (mic armed), records the default PipeWire source in short chunks,
+# transcribes each locally with whisper.cpp, and prints the transcribed text — one
+# utterance per line — to stdout. The flyout appends each line into the input box.
+# Toggling the mic off kills this process (SIGTERM), which stops cleanly.
+
+set -u
+WCPP="$HOME/.local/share/whisper.cpp"
+WH="$WCPP/build/bin/whisper-cli"
+MODEL="$WCPP/models/ggml-base.en.bin"
+CHUNK=4            # seconds per capture window
+TMP="$(mktemp -d /tmp/flyout-dictate.XXXXXX)"
+trap 'rm -rf "$TMP"' EXIT
+
+if [ ! -x "$WH" ] || [ ! -f "$MODEL" ]; then
+  echo "[voice: whisper.cpp not installed]"
+  exit 1
 fi
+
+# clean whisper output: strip [timestamps], blank/■ noise lines, leading spaces
+clean() {
+  sed -E 's/\[[0-9:.[:space:]>-]+\]//g' \
+    | sed -E 's/\(([^)]*)\)//g; s/\[[^]]*\]//g' \
+    | tr -d '\r' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
+    | grep -vE '^$' \
+    | grep -viE '^(\[?BLANK_AUDIO\]?|\[?INAUDIBLE\]?|\[?silence\]?|you|thanks for watching\.?|\.)$'
+}
+
+while true; do
+  WAV="$TMP/clip.wav"
+  # record CHUNK seconds, 16kHz mono (whisper's native rate) from default source
+  timeout $((CHUNK + 1)) pw-record --rate 16000 --channels 1 --format s16 "$WAV" >/dev/null 2>&1 &
+  rec=$!
+  sleep "$CHUNK"
+  kill "$rec" 2>/dev/null
+  wait "$rec" 2>/dev/null
+  [ -s "$WAV" ] || continue
+  # transcribe this chunk; -nt no timestamps, -np no progress, single thread-friendly
+  TXT="$("$WH" -m "$MODEL" -f "$WAV" -nt -np -t "$(nproc)" 2>/dev/null | clean | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+  if [ -n "$TXT" ]; then
+    echo "$TXT"
+  fi
+done
