@@ -318,7 +318,7 @@ function sessionIndex() {
   return new Promise(resolve => {
     execFile(
       'openclaw',
-      ['sessions', 'list', '--json', '--limit', '50'],
+      ['sessions', 'list', '--json', '--limit', '200'],
       { maxBuffer: 16 * 1024 * 1024 },
       (err, stdout) => {
         if (err || !stdout) return resolve([]);
@@ -381,11 +381,25 @@ function parseTranscript(raw) {
 }
 
 // Derive a drawer title from the first genuinely human user message.
+// Strong Ladywell-case tokens. We flag the drawer title with a scales prefix
+// only when the case is a SUBSTANTIAL topic — a single passing mention (e.g. a
+// Home-Assistant chat that referenced it once) must not brand the whole session.
+// So we count distinct token hits and require a threshold.
+const CASE_TOKENS = /ladywell|brethertons|jenner-?group|N60YX353|230743|mweston|matt weston|defence and counterclaim|counterclaim|freeholder|section 22|service charge|forfeiture/gi;
+
 function titleFor(sessionId) {
-  const msgs = parseTranscript(transcriptRaw(sessionId));
+  const raw = transcriptRaw(sessionId);
+  const msgs = parseTranscript(raw);
   const firstUser = msgs.find(m => m.role === 'user');
-  if (firstUser) return firstUser.content.replace(/\s+/g, ' ').slice(0, 60);
-  return null;
+  if (!firstUser) return null;
+  let title = firstUser.content.replace(/\s+/g, ' ').slice(0, 60);
+  // Count case-token hits across the transcript. Observed distribution: the
+  // case-dominated chats score 300-1100+, incidental mentions score <=170.
+  // >=100 flags only sessions where Ladywell is the dominant topic, so the flag
+  // stays useful for finding *the* legal chat. Tunable if it under/over-flags.
+  const hits = (raw.match(CASE_TOKENS) || []).length;
+  if (hits >= 100) title = '⚖ Ladywell — ' + title;
+  return title;
 }
 
 // Which session keys are real, user-facing chats worth listing in the drawer.
@@ -393,7 +407,7 @@ function titleFor(sessionId) {
 // are noise that "does nothing" when clicked.
 function isChatSession(key) {
   if (!key) return false;
-  if (/:cron:|:run:|:hook:|:node:/.test(key)) return false;
+  if (/:cron:|:run:|:hook:|:node:|:subagent:/.test(key)) return false;
   const name = key.replace(/^agent:[^:]+:/, '');
   if (/test|diag|probe|selftest|healthprobe|flytest|\bempty\b/i.test(name)) return false;
   if (/^flyout-\d/i.test(name)) return false;
