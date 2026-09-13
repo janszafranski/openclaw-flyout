@@ -33,9 +33,16 @@ const MODEL_ID = 'openclaw';
 // Retry a turn that failed for a transient reason (gateway restart / OOM kill /
 // provider failover mid-turn). The gateway auto-clears the session after such a
 // failure, so a fresh retry almost always succeeds.
-const AGENT_RETRIES = parseInt(process.env.OPENCLAW_BRIDGE_RETRIES || '1', 10);
-const RETRY_DELAY_MS = parseInt(process.env.OPENCLAW_BRIDGE_RETRY_DELAY_MS || '1500', 10);
-const TRANSIENT_RE = /FailoverError|Claude CLI failed|gateway (restart|shutdown|restarting)|UNAVAILABLE|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|active run|Command failed|exited before reply|non-?zero exit|timed? ?out/i;
+// Retries default high + a moderate delay because the #1 transient here is a
+// TURN-CLAIM COLLISION: the flyout shares its gateway session with the main
+// agent, so while the main agent is mid-turn the gateway rejects a flyout turn
+// with "already has an active turn claim". That is NOT a failure — the claim
+// frees the instant the main turn ends — so we must WAIT IT OUT and retry,
+// not surface "(no reply)". 8 retries x 2s ≈ 16s of patience covers a normal
+// turn; a very long main turn just needs a resend.
+const AGENT_RETRIES = parseInt(process.env.OPENCLAW_BRIDGE_RETRIES || '8', 10);
+const RETRY_DELAY_MS = parseInt(process.env.OPENCLAW_BRIDGE_RETRY_DELAY_MS || '2000', 10);
+const TRANSIENT_RE = /FailoverError|Claude CLI failed|gateway (restart|shutdown|restarting)|UNAVAILABLE|ECONNREFUSED|ECONNRESET|socket hang up|EPIPE|active run|active turn claim|turn claim|already has an active|Command failed|exited before reply|non-?zero exit|timed? ?out/i;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const firstLine = e => String((e && e.message) || e || '').split('\n')[0];
@@ -561,10 +568,14 @@ const server = http.createServer((req, res) => {
             for (const p of parts) sseChunk(res, p);
           } catch (e) {
             console.error('[bridge] one-shot turn failed:', firstLine(e));
-            const transient = TRANSIENT_RE.test(e && e.message ? e.message : '');
-            sseChunk(res, transient
-              ? '**Bridge**: the gateway was busy or restarting and the turn was interrupted — try again in a moment.'
-              : '**Bridge error**: ' + e.message);
+            const emsg = e && e.message ? e.message : '';
+            const claim = /turn claim|active run|already has an active/i.test(emsg);
+            const transient = TRANSIENT_RE.test(emsg);
+            sseChunk(res, claim
+              ? '**Bridge**: the main agent is still finishing its previous turn, so this message could not start yet. Please send it again in a moment.'
+              : transient
+                ? '**Bridge**: the gateway was busy or restarting and the turn was interrupted — try again in a moment.'
+                : '**Bridge error**: ' + e.message);
           }
         }
       }
