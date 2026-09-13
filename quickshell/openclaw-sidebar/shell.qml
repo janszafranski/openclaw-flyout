@@ -459,11 +459,33 @@ ShellRoot {
                     }
                 }
                 if (!changed) return;   // identical → no repaint, no flash
-                chatModel.clear();
-                for (var k = 0; k < next.length; k++) chatModel.append(next[k]);
-                // Pin to newest after a real (re)load; ListView.onContentHeightChanged
-                // keeps re-asserting it as the text bubbles finish sizing.
-                if (typeof list !== "undefined") list.toBottom();
+                // APPEND-ONLY when the store is an unchanged PREFIX of what we show
+                // plus new rows at the end (the common poll case: a turn completed,
+                // a few rows added). A full clear()+refill of a ~1500-row model
+                // resets the viewport every poll — that's the "repeated chunks /
+                // can't scroll up" bug: scroll up, next poll rebuilds + snaps you
+                // back. So only clear() when the prefix genuinely diverged (session
+                // switch / an edit rewrote history); otherwise just append the tail,
+                // which leaves scroll position untouched.
+                var prefixMatches = (next.length > chatModel.count);
+                if (prefixMatches) {
+                    for (var p = 0; p < chatModel.count; p++) {
+                        if (chatModel.get(p).role !== next[p].role ||
+                            chatModel.get(p).content !== next[p].content) { prefixMatches = false; break; }
+                    }
+                }
+                if (prefixMatches) {
+                    for (var a = chatModel.count; a < next.length; a++) chatModel.append(next[a]);
+                } else {
+                    chatModel.clear();
+                    for (var k = 0; k < next.length; k++) chatModel.append(next[k]);
+                }
+                // Pin to newest ONLY if the user is already parked at the bottom
+                // (stickToBottom). If they scrolled up to read history, leave their
+                // viewport alone — a background poll must not drag them to the end.
+                // A session switch / new-message send sets stickToBottom=true first,
+                // so those still scroll down correctly.
+                if (typeof list !== "undefined" && list.stickToBottom) list.toBottom();
             } catch (e) { /* ignore */ }
         };
         xhr.send();
@@ -472,6 +494,8 @@ ShellRoot {
     function switchSession(key) {
         root.currentSession = key;
         root.sessionsOpen = false;
+        // A deliberate switch should land on the newest message.
+        if (typeof list !== "undefined") list.stickToBottom = true;
         root.loadHistory(key);
         // Only persist real chat keys — never a cron/probe key that would reopen blank.
         if (root.isChatKey(key)) {
@@ -494,6 +518,9 @@ ShellRoot {
     function sendMessage(text) {
         var t = (text || "").trim();
         if (t.length === 0) return;
+        // The user just sent — always follow to the bottom, even if they'd
+        // scrolled up to read history (which would have cleared stickToBottom).
+        if (typeof list !== "undefined") list.stickToBottom = true;
         chatModel.append({ "role": "user", "content": t });
         root.pending.push(t);
         root.pumpQueue();
@@ -791,7 +818,12 @@ ShellRoot {
                     // we're actually at the end. Also honour a user who scrolls up.
                     property bool stickToBottom: true
                     function toBottom() { stickToBottom = true; Qt.callLater(function(){ list.positionViewAtEnd() }) }
-                    onCountChanged: toBottom()
+                    // Only follow new rows to the bottom if the user is ALREADY at the
+                    // bottom. If they scrolled up to read history, a background poll
+                    // that appends rows must NOT re-arm stick-to-bottom and yank them
+                    // down. toBottom() (called explicitly on send / session switch)
+                    // still forces stickToBottom=true when we DO want to follow.
+                    onCountChanged: if (stickToBottom) Qt.callLater(function(){ list.positionViewAtEnd() })
                     onContentHeightChanged: if (stickToBottom) Qt.callLater(function(){ list.positionViewAtEnd() })
                     onMovementEnded: stickToBottom = (contentY >= originY + contentHeight - height - 40)
 
