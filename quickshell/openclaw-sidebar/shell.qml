@@ -41,6 +41,25 @@ ShellRoot {
     property bool   sessionsOpen: false                       // recent-chats drawer open
     property string activity: ""                              // live tool/thinking status for the in-flight turn
 
+    // --- claudebar usage strip (bottom) -------------------------------------
+    // Polls `claudebar --json` (pure-bash CLI in ~/.local/bin, reads the logged-in
+    // `claude` OAuth token) and shows Claude plan usage. Data-only JSON; we paint
+    // it in our own palette using the gauge stops the CLI hands back.
+    property string cbPlan:    ""      // e.g. "Max 5x"
+    property int    cbSession: -1      // session (5h) used %  (-1 = unknown/not loaded)
+    property int    cbWeekly:  -1      // weekly (7d) used %
+    property string cbErr:     ""      // non-empty when the CLI reported an error
+    property var    cbStops:   []      // [{pct,color}] ramp from the CLI palette
+    // Map a used-% to a colour along the CLI's own gauge ramp.
+    function cbColor(pct) {
+        if (pct < 0 || !cbStops || cbStops.length === 0) return root.colSubtle;
+        var c = cbStops[0].color;
+        for (var i = 0; i < cbStops.length; i++) {
+            if (pct >= cbStops[i].pct) c = cbStops[i].color; else break;
+        }
+        return c;
+    }
+
     Timer {
         interval: 1000; repeat: true; running: root.busy
         onTriggered: root.elapsed += 1
@@ -196,6 +215,43 @@ ShellRoot {
             settleTimer.restart(); // hold the history poll off until the turn flushes
             root.pumpQueue();      // send next queued message, if any
         }
+    }
+
+    // --- claudebar poller: one-shot `claudebar --json`, parsed on exit ---
+    // A one-shot command (not a stream), so we buffer stdout and parse in onExited.
+    property string cbBuf: ""
+    property bool cbForceRefresh: false
+    Process {
+        id: cbProc
+        command: ["sh", "-lc", root.cbForceRefresh ? "claudebar --json --refresh 2>/dev/null" : "claudebar --json 2>/dev/null"]
+        stdout: SplitParser {
+            splitMarker: "\n"          // accumulate all lines; reassemble in onExited
+            onRead: function(seg) { root.cbBuf += seg + "\n"; }
+        }
+        onExited: function(exitCode, exitStatus) {
+            try {
+                var j = JSON.parse(root.cbBuf);
+                root.cbErr = j.error ? String(j.error) : "";
+                root.cbPlan = j.plan || "";
+                root.cbStops = (j.palette && j.palette.stops) ? j.palette.stops : [];
+                for (var i = 0; i < (j.windows ? j.windows.length : 0); i++) {
+                    var w = j.windows[i];
+                    if (w.group) continue;                 // skip per-model rows in the strip
+                    if (w.id === "session") root.cbSession = w.used_pct;
+                    else if (w.id === "weekly") root.cbWeekly = w.used_pct;
+                }
+            } catch (e) {
+                root.cbErr = "parse";
+            }
+            root.cbBuf = "";
+            root.cbForceRefresh = false;   // one-shot: revert to cached poll after a manual refresh
+        }
+    }
+    Timer {
+        id: cbTimer
+        interval: 90000; repeat: true; running: true    // refresh every 90s while open
+        triggeredOnStart: true
+        onTriggered: { root.cbBuf = ""; cbProc.running = true; }
     }
 
     // On startup fetch history + recent chats. The bridge (systemd) may not be up
@@ -730,6 +786,56 @@ ShellRoot {
                         verticalAlignment: Text.AlignVCenter
                     }
                 }
+                // ---------- claudebar usage strip ----------
+                // Glanceable Claude plan usage: session (5h) + weekly (7d), each a
+                // mini bar coloured along the CLI's own gauge ramp. Hidden until first
+                // successful poll. Click to force a refresh.
+                Rectangle {
+                    Layout.fillWidth: true
+                    visible: root.cbSession >= 0 || root.cbErr.length > 0
+                    color: root.colHeader
+                    implicitHeight: 24
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 14; anchors.rightMargin: 14
+                        spacing: 10
+                        // one gauge = label + track + used% text
+                        component Gauge: RowLayout {
+                            property string tag: ""
+                            property int pct: -1
+                            spacing: 5
+                            Label { text: tag; color: root.colSubtle; font.pixelSize: 11 }
+                            Rectangle {   // track
+                                Layout.preferredWidth: 46; Layout.preferredHeight: 6
+                                radius: 3; color: root.colBorder
+                                Rectangle {   // fill
+                                    height: parent.height; radius: 3
+                                    width: parent.width * Math.max(0, Math.min(100, pct)) / 100
+                                    color: root.cbColor(pct)
+                                }
+                            }
+                            Label { text: (pct >= 0 ? pct + "%" : "—"); color: root.colText; font.pixelSize: 11 }
+                        }
+                        Label {
+                            text: root.cbPlan.length ? root.cbPlan : "Claude"
+                            color: root.colAccent; font.pixelSize: 11; font.bold: true
+                        }
+                        Item { Layout.fillWidth: true }
+                        Gauge { tag: "5h";  pct: root.cbSession; visible: root.cbErr.length === 0 }
+                        Gauge { tag: "wk";  pct: root.cbWeekly;  visible: root.cbErr.length === 0 }
+                        Label {
+                            visible: root.cbErr.length > 0
+                            text: "usage: " + root.cbErr
+                            color: root.colSubtle; font.pixelSize: 11; font.italic: true
+                        }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: { root.cbBuf = ""; root.cbForceRefresh = true; cbProc.running = true; }
+                    }
+                }
+
                 // separator above the input — colScallop (solid black) not colBorder:
                 // the grey #222 line read as "a light grey line at the bottom".
                 Rectangle { Layout.fillWidth: true; height: 1; color: root.colScallop }
