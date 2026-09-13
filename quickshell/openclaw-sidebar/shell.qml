@@ -939,7 +939,7 @@ ShellRoot {
                     implicitHeight: 28
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 14; anchors.rightMargin: 20
+                        anchors.leftMargin: 14; anchors.rightMargin: 30
                         spacing: 10
                         // one gauge = label + track + used% text
                         component Gauge: RowLayout {
@@ -974,9 +974,10 @@ ShellRoot {
                     // chevron toggle that expands the full breakdown — enlarged so it's
                     // an easy tap target (below the MouseArea; z keeps it painted).
                     Label {
-                        anchors.right: parent.right; anchors.rightMargin: 2
+                        anchors.right: parent.right; anchors.rightMargin: 12
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.cbExpanded ? "▾" : "▸"
+                        // panel expands UPWARD, so open points up (▴), closed points right (▸)
+                        text: root.cbExpanded ? "▴" : "▸"
                         color: root.colAccent; font.pixelSize: 18; font.bold: true
                         z: 1
                     }
