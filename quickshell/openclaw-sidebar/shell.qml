@@ -76,6 +76,42 @@ ShellRoot {
         return c;
     }
 
+    // --- voice input (dictation) --------------------------------------------
+    // The mic button (between the text box and Send) toggles this. When armed we
+    // run ~/.local/bin/flyout-dictate, which records from the default source,
+    // transcribes locally (whisper.cpp), and prints the text to stdout. We append
+    // that text into the input box. Toggling off kills the helper.
+    property bool voiceOn: false
+    function toggleVoice() {
+        if (root.voiceOn) {
+            // stop: killing the process fires onExited, which flips voiceOn off
+            voiceProc.running = false;
+        } else {
+            voiceBuf = "";
+            root.voiceOn = true;
+            voiceProc.running = true;
+        }
+    }
+    property string voiceBuf: ""
+    Process {
+        id: voiceProc
+        command: ["sh", "-lc", "flyout-dictate 2>/dev/null"]
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: function(seg) {
+                // each line the helper emits is transcribed text -> append to input
+                var t = seg.trim();
+                if (t.length === 0) return;
+                if (input.text.length > 0 && !input.text.endsWith(" ")) input.text += " ";
+                input.text += t;
+            }
+        }
+        onExited: function(exitCode, exitStatus) {
+            root.voiceOn = false;
+            root.voiceBuf = "";
+        }
+    }
+
     Timer {
         interval: 1000; repeat: true; running: root.busy
         onTriggered: root.elapsed += 1
@@ -1006,6 +1042,65 @@ ShellRoot {
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        // ---------- mic / voice-input toggle ----------
+                        // Sits between the text box and Send. Toggles root.voiceOn;
+                        // starts/stops the dictation helper (records -> transcribes ->
+                        // appends the text into the input box). Mauve + pulsing while armed.
+                        Rectangle {
+                            id: micBtn
+                            Layout.preferredWidth: 40
+                            Layout.preferredHeight: 40
+                            radius: 10
+                            // armed = solid mauve; idle = subtle grey fill so it's
+                            // clearly visible against the black panel (the emoji glyph
+                            // renders monochrome here, so the BUTTON must carry the look).
+                            color: root.voiceOn ? root.colAccent
+                                   : (micMouse.containsMouse ? "#33cba6f7" : "#22ffffff")
+                            border.color: root.voiceOn ? root.colAccent : root.colAccent
+                            border.width: root.voiceOn ? 0 : 1
+                            // Drawn mic glyph (no emoji dependency): a capsule + stand.
+                            Item {
+                                anchors.centerIn: parent
+                                width: 18; height: 22
+                                property color mc: root.voiceOn ? "#11111b" : root.colAccent
+                                Rectangle {   // capsule (the mic body)
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 0; width: 8; height: 12; radius: 4
+                                    color: parent.mc
+                                }
+                                Rectangle {   // arc/stand under the capsule
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 9; width: 14; height: 8; radius: 6
+                                    color: "transparent"
+                                    border.color: parent.mc; border.width: 2
+                                    // clip to a lower half-arc look
+                                }
+                                Rectangle {   // stem
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 16; width: 2; height: 5; color: parent.mc
+                                }
+                                Rectangle {   // base
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    y: 20; width: 10; height: 2; radius: 1; color: parent.mc
+                                }
+                            }
+                            // pulsing while listening
+                            SequentialAnimation on opacity {
+                                running: root.voiceOn
+                                loops: Animation.Infinite
+                                NumberAnimation { to: 0.55; duration: 650; easing.type: Easing.InOutQuad }
+                                NumberAnimation { to: 1.0;  duration: 650; easing.type: Easing.InOutQuad }
+                            }
+                            onVisibleChanged: if (!visible) opacity = 1.0
+                            MouseArea {
+                                id: micMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.toggleVoice()
                             }
                         }
 

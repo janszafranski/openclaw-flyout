@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# flyout-dictate — placeholder. The real version records from the default PipeWire
+# source and transcribes locally with whisper.cpp, printing each transcribed
+# utterance as one line on stdout. Until whisper.cpp is installed, this emits a
+# single notice line and exits so the mic toggle has something to talk to.
+if command -v whisper-cli >/dev/null 2>&1 || test -x "$HOME/.local/share/whisper.cpp/main"; then
+  # (real path gets wired here once whisper.cpp is installed)
+  echo "[dictation backend not configured yet]"
+else
+  echo "[voice input not set up yet — ask OpenClaw to install whisper.cpp]"
+fi
