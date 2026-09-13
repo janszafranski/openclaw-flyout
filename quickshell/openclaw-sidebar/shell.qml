@@ -936,10 +936,10 @@ ShellRoot {
                     Layout.fillWidth: true
                     visible: root.cbSession >= 0 || root.cbErr.length > 0
                     color: root.colHeader
-                    implicitHeight: 24
+                    implicitHeight: 28
                     RowLayout {
                         anchors.fill: parent
-                        anchors.leftMargin: 14; anchors.rightMargin: 14
+                        anchors.leftMargin: 14; anchors.rightMargin: 20
                         spacing: 10
                         // one gauge = label + track + used% text
                         component Gauge: RowLayout {
@@ -971,12 +971,13 @@ ShellRoot {
                             color: root.colSubtle; font.pixelSize: 11; font.italic: true
                         }
                     }
-                    // little chevron hint that it expands (below the MouseArea; z keeps it painted)
+                    // chevron toggle that expands the full breakdown — enlarged so it's
+                    // an easy tap target (below the MouseArea; z keeps it painted).
                     Label {
                         anchors.right: parent.right; anchors.rightMargin: 2
                         anchors.verticalCenter: parent.verticalCenter
                         text: root.cbExpanded ? "▾" : "▸"
-                        color: root.colSubtle; font.pixelSize: 10
+                        color: root.colAccent; font.pixelSize: 18; font.bold: true
                         z: 1
                     }
                     // MouseArea declared LAST so it sits above the RowLayout + chevron and
@@ -1068,9 +1069,9 @@ ShellRoot {
                         // appends the text into the input box). Mauve + pulsing while armed.
                         Rectangle {
                             id: micBtn
-                            Layout.preferredWidth: 52
-                            Layout.preferredHeight: 52
-                            radius: 12
+                            Layout.preferredWidth: 40
+                            Layout.preferredHeight: 40
+                            radius: 10
                             // armed = solid mauve; idle = subtle grey fill so it's
                             // clearly visible against the black panel (the emoji glyph
                             // renders monochrome here, so the BUTTON must carry the look).
@@ -1081,26 +1082,26 @@ ShellRoot {
                             // Drawn mic glyph (no emoji dependency): a capsule + stand.
                             Item {
                                 anchors.centerIn: parent
-                                width: 24; height: 30
+                                width: 18; height: 22
                                 property color mc: root.voiceOn ? "#11111b" : root.colAccent
                                 Rectangle {   // capsule (the mic body)
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 0; width: 11; height: 16; radius: 5
+                                    y: 0; width: 8; height: 12; radius: 4
                                     color: parent.mc
                                 }
                                 Rectangle {   // arc/stand under the capsule
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 12; width: 19; height: 11; radius: 8
+                                    y: 9; width: 14; height: 8; radius: 6
                                     color: "transparent"
-                                    border.color: parent.mc; border.width: 3
+                                    border.color: parent.mc; border.width: 2
                                 }
                                 Rectangle {   // stem
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 22; width: 3; height: 6; color: parent.mc
+                                    y: 16; width: 2; height: 5; color: parent.mc
                                 }
                                 Rectangle {   // base
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 27; width: 13; height: 3; radius: 1; color: parent.mc
+                                    y: 20; width: 10; height: 2; radius: 1; color: parent.mc
                                 }
                             }
                             // pulsing while listening
