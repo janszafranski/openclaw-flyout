@@ -810,14 +810,15 @@ ShellRoot {
                 // extra_usage (spend / balance) block when the API reports it.
                 Rectangle {
                     Layout.fillWidth: true
+                    Layout.preferredHeight: root.cbExpanded ? (cbDetailCol.implicitHeight + 12) : 0
                     visible: root.cbExpanded && root.cbErr.length === 0
+                    clip: true
                     color: root.colHeader
-                    implicitHeight: cbDetailCol.implicitHeight + 12
                     ColumnLayout {
                         id: cbDetailCol
-                        anchors.fill: parent
-                        anchors.leftMargin: 14; anchors.rightMargin: 14
-                        anchors.topMargin: 6;  anchors.bottomMargin: 6
+                        width: parent.width - 28
+                        x: 14
+                        y: 6
                         spacing: 6
                         Repeater {
                             model: root.cbWindows
@@ -934,21 +935,25 @@ ShellRoot {
                             color: root.colSubtle; font.pixelSize: 11; font.italic: true
                         }
                     }
+                    // little chevron hint that it expands (below the MouseArea; z keeps it painted)
+                    Label {
+                        anchors.right: parent.right; anchors.rightMargin: 2
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.cbExpanded ? "▾" : "▸"
+                        color: root.colSubtle; font.pixelSize: 10
+                        z: 1
+                    }
+                    // MouseArea declared LAST so it sits above the RowLayout + chevron and
+                    // actually receives clicks (layout children were eating them before).
                     MouseArea {
                         anchors.fill: parent
+                        z: 2
                         cursorShape: Qt.PointingHandCursor
                         // Click toggles the detail panel; opening it also forces a refresh.
                         onClicked: {
                             root.cbExpanded = !root.cbExpanded;
                             if (root.cbExpanded) { root.cbBuf = ""; root.cbForceRefresh = true; cbProc.running = true; }
                         }
-                    }
-                    // little chevron hint that it expands
-                    Label {
-                        anchors.right: parent.right; anchors.rightMargin: 2
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: root.cbExpanded ? "▾" : "▸"
-                        color: root.colSubtle; font.pixelSize: 10
                     }
                 }
 
