@@ -50,6 +50,22 @@ ShellRoot {
     property int    cbWeekly:  -1      // weekly (7d) used %
     property string cbErr:     ""      // non-empty when the CLI reported an error
     property var    cbStops:   []      // [{pct,color}] ramp from the CLI palette
+    property var    cbWindows: []      // full windows[] (session, weekly, per-model) for the panel
+    property var    cbExtra:   null    // extra_usage object (spend/balance) or null
+    property bool   cbExpanded: false  // detail panel open?
+    // "2026-09-13T17:10:00Z" -> "resets in 2h 51m" (or "resets in 3d 4h")
+    function cbUntil(iso) {
+        if (!iso) return "";
+        var t = Date.parse(iso);
+        if (isNaN(t)) return "";
+        var s = Math.max(0, Math.floor((t - Date.now()) / 1000));
+        var d = Math.floor(s / 86400); s -= d * 86400;
+        var h = Math.floor(s / 3600);  s -= h * 3600;
+        var m = Math.floor(s / 60);
+        if (d > 0) return "resets in " + d + "d " + h + "h";
+        if (h > 0) return "resets in " + h + "h " + m + "m";
+        return "resets in " + m + "m";
+    }
     // Map a used-% to a colour along the CLI's own gauge ramp.
     function cbColor(pct) {
         if (pct < 0 || !cbStops || cbStops.length === 0) return root.colSubtle;
@@ -234,6 +250,8 @@ ShellRoot {
                 root.cbErr = j.error ? String(j.error) : "";
                 root.cbPlan = j.plan || "";
                 root.cbStops = (j.palette && j.palette.stops) ? j.palette.stops : [];
+                root.cbWindows = j.windows || [];
+                root.cbExtra = j.extra_usage || null;
                 for (var i = 0; i < (j.windows ? j.windows.length : 0); i++) {
                     var w = j.windows[i];
                     if (w.group) continue;                 // skip per-model rows in the strip
@@ -786,10 +804,97 @@ ShellRoot {
                         verticalAlignment: Text.AlignVCenter
                     }
                 }
+                // ---------- claudebar detail panel (click strip to expand) ----------
+                // Full breakdown: every window (session, weekly, per-model) as a row
+                // with a bar, used%, pace indicator and reset countdown; plus the
+                // extra_usage (spend / balance) block when the API reports it.
+                Rectangle {
+                    Layout.fillWidth: true
+                    visible: root.cbExpanded && root.cbErr.length === 0
+                    color: root.colHeader
+                    implicitHeight: cbDetailCol.implicitHeight + 12
+                    ColumnLayout {
+                        id: cbDetailCol
+                        anchors.fill: parent
+                        anchors.leftMargin: 14; anchors.rightMargin: 14
+                        anchors.topMargin: 6;  anchors.bottomMargin: 6
+                        spacing: 6
+                        Repeater {
+                            model: root.cbWindows
+                            delegate: ColumnLayout {
+                                Layout.fillWidth: true
+                                spacing: 1
+                                required property var modelData
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        // "Session", "Weekly", or "Weekly · Fable" for model rows
+                                        text: modelData.group ? (modelData.label + " · " + modelData.group) : modelData.label
+                                        color: root.colText; font.pixelSize: 11; font.bold: true
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    Label {
+                                        // pace: e.g. "↓ 81% under" (green) or "↑ over" (amber/red)
+                                        text: modelData.pace ? (modelData.pace.indicator + " " + modelData.pace.ratio_label) : ""
+                                        color: (modelData.pace && modelData.pace.state === "over") ? root.cbColor(90) : root.colSubtle
+                                        font.pixelSize: 10
+                                    }
+                                }
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Rectangle {   // track
+                                        Layout.fillWidth: true; Layout.preferredHeight: 6
+                                        radius: 3; color: root.colBorder
+                                        Rectangle {   // used fill
+                                            height: parent.height; radius: 3
+                                            width: parent.width * Math.max(0, Math.min(100, modelData.used_pct)) / 100
+                                            color: root.cbColor(modelData.used_pct)
+                                        }
+                                        Rectangle {   // elapsed-time marker (thin line = how far through the window)
+                                            width: 1; height: parent.height
+                                            x: parent.width * Math.max(0, Math.min(100, modelData.elapsed_pct)) / 100
+                                            color: root.colText; opacity: 0.5
+                                        }
+                                    }
+                                    Label {
+                                        text: modelData.used_pct + "%"
+                                        color: root.colText; font.pixelSize: 11
+                                        Layout.preferredWidth: 30; horizontalAlignment: Text.AlignRight
+                                    }
+                                }
+                                Label {
+                                    text: root.cbUntil(modelData.reset_at)
+                                    color: root.colSubtle; font.pixelSize: 10
+                                }
+                            }
+                        }
+                        // extra_usage: spend this month / prepaid balance / monthly limit
+                        Rectangle {
+                            Layout.fillWidth: true; height: 1; color: root.colBorder
+                            visible: root.cbExtra !== null
+                        }
+                        Label {
+                            visible: root.cbExtra !== null
+                            Layout.fillWidth: true
+                            text: {
+                                if (!root.cbExtra) return "";
+                                var e = root.cbExtra; var parts = [];
+                                if (e.spent_label)   parts.push("spent " + e.spent_label);
+                                if (e.balance_label) parts.push("balance " + e.balance_label);
+                                if (e.limit_label)   parts.push("limit " + e.limit_label);
+                                return parts.join("  ·  ");
+                            }
+                            color: root.colSubtle; font.pixelSize: 10; wrapMode: Text.Wrap
+                        }
+                    }
+                }
+
                 // ---------- claudebar usage strip ----------
                 // Glanceable Claude plan usage: session (5h) + weekly (7d), each a
                 // mini bar coloured along the CLI's own gauge ramp. Hidden until first
-                // successful poll. Click to force a refresh.
+                // successful poll. Click to expand the full breakdown.
                 Rectangle {
                     Layout.fillWidth: true
                     visible: root.cbSession >= 0 || root.cbErr.length > 0
@@ -832,7 +937,18 @@ ShellRoot {
                     MouseArea {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: { root.cbBuf = ""; root.cbForceRefresh = true; cbProc.running = true; }
+                        // Click toggles the detail panel; opening it also forces a refresh.
+                        onClicked: {
+                            root.cbExpanded = !root.cbExpanded;
+                            if (root.cbExpanded) { root.cbBuf = ""; root.cbForceRefresh = true; cbProc.running = true; }
+                        }
+                    }
+                    // little chevron hint that it expands
+                    Label {
+                        anchors.right: parent.right; anchors.rightMargin: 2
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.cbExpanded ? "▾" : "▸"
+                        color: root.colSubtle; font.pixelSize: 10
                     }
                 }
 
