@@ -1045,15 +1045,32 @@ ShellRoot {
                             }
                         }
 
+                        Button {
+                            text: "Send"
+                            enabled: input.text.trim().length > 0
+                            onClicked: { root.sendMessage(input.text); input.clear(); }
+                            contentItem: Label {
+                                text: parent.text
+                                color: parent.enabled ? "#11111b" : root.colSubtle
+                                font.pixelSize: 13; font.bold: true
+                                horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 10
+                                color: parent.enabled ? (parent.down ? Qt.darker(root.colAccent, 1.2) : root.colAccent) : root.colBorder
+                            }
+                            Layout.preferredHeight: 40
+                        }
+
                         // ---------- mic / voice-input toggle ----------
-                        // Sits between the text box and Send. Toggles root.voiceOn;
+                        // Rightmost control (after Send). Toggles root.voiceOn;
                         // starts/stops the dictation helper (records -> transcribes ->
                         // appends the text into the input box). Mauve + pulsing while armed.
                         Rectangle {
                             id: micBtn
-                            Layout.preferredWidth: 40
-                            Layout.preferredHeight: 40
-                            radius: 10
+                            Layout.preferredWidth: 52
+                            Layout.preferredHeight: 52
+                            radius: 12
                             // armed = solid mauve; idle = subtle grey fill so it's
                             // clearly visible against the black panel (the emoji glyph
                             // renders monochrome here, so the BUTTON must carry the look).
@@ -1064,27 +1081,26 @@ ShellRoot {
                             // Drawn mic glyph (no emoji dependency): a capsule + stand.
                             Item {
                                 anchors.centerIn: parent
-                                width: 18; height: 22
+                                width: 24; height: 30
                                 property color mc: root.voiceOn ? "#11111b" : root.colAccent
                                 Rectangle {   // capsule (the mic body)
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 0; width: 8; height: 12; radius: 4
+                                    y: 0; width: 11; height: 16; radius: 5
                                     color: parent.mc
                                 }
                                 Rectangle {   // arc/stand under the capsule
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 9; width: 14; height: 8; radius: 6
+                                    y: 12; width: 19; height: 11; radius: 8
                                     color: "transparent"
-                                    border.color: parent.mc; border.width: 2
-                                    // clip to a lower half-arc look
+                                    border.color: parent.mc; border.width: 3
                                 }
                                 Rectangle {   // stem
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 16; width: 2; height: 5; color: parent.mc
+                                    y: 22; width: 3; height: 6; color: parent.mc
                                 }
                                 Rectangle {   // base
                                     anchors.horizontalCenter: parent.horizontalCenter
-                                    y: 20; width: 10; height: 2; radius: 1; color: parent.mc
+                                    y: 27; width: 13; height: 3; radius: 1; color: parent.mc
                                 }
                             }
                             // pulsing while listening
@@ -1102,23 +1118,6 @@ ShellRoot {
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: root.toggleVoice()
                             }
-                        }
-
-                        Button {
-                            text: "Send"
-                            enabled: input.text.trim().length > 0
-                            onClicked: { root.sendMessage(input.text); input.clear(); }
-                            contentItem: Label {
-                                text: parent.text
-                                color: parent.enabled ? "#11111b" : root.colSubtle
-                                font.pixelSize: 13; font.bold: true
-                                horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
-                            }
-                            background: Rectangle {
-                                radius: 10
-                                color: parent.enabled ? (parent.down ? Qt.darker(root.colAccent, 1.2) : root.colAccent) : root.colBorder
-                            }
-                            Layout.preferredHeight: 40
                         }
                     }
                 }
