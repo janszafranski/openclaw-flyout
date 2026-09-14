@@ -46,6 +46,7 @@ ShellRoot {
     // `claude` OAuth token) and shows Claude plan usage. Data-only JSON; we paint
     // it in our own palette using the gauge stops the CLI hands back.
     property string cbPlan:    ""      // e.g. "Max 5x"
+    property string cbModel:   ""      // background AI model, short form e.g. "Opus 4.8"
     property int    cbSession: -1      // session (5h) used %  (-1 = unknown/not loaded)
     property int    cbWeekly:  -1      // weekly (7d) used %
     property string cbErr:     ""      // non-empty when the CLI reported an error
@@ -191,7 +192,8 @@ ShellRoot {
             { "label": "ChatGPT GUI", "cmd": "xdg-open https://chatgpt.com", "icon": iconDir + "openai.svg", "terminal": false },
             { "label": "Jan GUI",     "cmd": "jan",                          "icon": iconDir + "jan.png",    "terminal": false },
             { "label": "NotebookLM",  "cmd": "xdg-open https://notebooklm.google.com", "icon": iconDir + "gemini.svg", "terminal": false },
-            { "label": "Claude CLI",  "cmd": "kitty claude",                 "icon": iconDir + "claude.svg", "terminal": true },
+            // `claude+` = Jan's fish alias; expand it here since the launcher runs via sh, not fish.
+            { "label": "Claude CLI",  "cmd": "kitty claude --allow-dangerously-skip-permissions --permission-mode bypassPermissions", "icon": iconDir + "claude.svg", "terminal": true },
             { "label": "AskGPT CLI",  "cmd": "kitty tgpt -i",                "icon": iconDir + "openai.svg", "terminal": true },
             { "label": "Jan CLI",     "cmd": "kitty fish -C 'jan-cli --help'", "icon": iconDir + "jan.png",  "terminal": true }
         ];
@@ -306,6 +308,40 @@ ShellRoot {
         interval: 90000; repeat: true; running: true    // refresh every 90s while open
         triggeredOnStart: true
         onTriggered: { root.cbBuf = ""; cbProc.running = true; }
+    }
+
+    // --- background AI model reader (shown on the usage strip before the plan) ---
+    // The flyout talks to the main OpenClaw agent, whose model is the config default
+    // at agents.defaults.model.primary in ~/.openclaw/openclaw.json (e.g.
+    // "anthropic/claude-opus-4-8"). We read it once at startup and shorten it to a
+    // human label like "Opus 4.8". One-shot; re-run only if the file changes matter.
+    Process {
+        id: cbModelProc
+        running: true
+        command: ["sh", "-lc",
+            "python3 - <<'PY'\n" +
+            "import json,os,re\n" +
+            "p=os.path.expanduser('~/.openclaw/openclaw.json')\n" +
+            "m=''\n" +
+            "try:\n" +
+            "  d=json.load(open(p))\n" +
+            "  m=(((d.get('agents') or {}).get('defaults') or {}).get('model') or {}).get('primary') or ''\n" +
+            "except Exception: m=''\n" +
+            "s=m.split('/')[-1]                    # drop provider prefix\n" +
+            "s=re.sub(r'^claude-','',s)            # drop 'claude-'\n" +
+            "s=re.sub(r'-\\\\d{6,}$','',s)           # drop trailing date id\n" +
+            "parts=[w.capitalize() if w.isalpha() else w for w in s.split('-')]\n" +
+            "# join a bare version like ['4','8'] with a dot: Opus 4 8 -> Opus 4.8\n" +
+            "out=[]\n" +
+            "for w in parts:\n" +
+            "  if out and out[-1].isdigit() and w.isdigit(): out[-1]=out[-1]+'.'+w\n" +
+            "  else: out.append(w)\n" +
+            "print(' '.join(out))\n" +
+            "PY"]
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: function(seg) { var t = seg.trim(); if (t.length) root.cbModel = t; }
+        }
     }
 
     // On startup fetch history + recent chats. The bridge (systemd) may not be up
@@ -999,6 +1035,12 @@ ShellRoot {
                             }
                             Label { text: (pct >= 0 ? pct + "%" : "—"); color: root.colText; font.pixelSize: 11 }
                         }
+                        // background AI model, shown just before the plan/subscription.
+                        Label {
+                            visible: root.cbModel.length > 0
+                            text: root.cbModel
+                            color: root.colText; font.pixelSize: 11
+                        }
                         Label {
                             text: root.cbPlan.length ? root.cbPlan : "Claude"
                             color: root.colAccent; font.pixelSize: 11; font.bold: true
@@ -1017,8 +1059,9 @@ ShellRoot {
                     Label {
                         anchors.right: parent.right; anchors.rightMargin: 12
                         anchors.verticalCenter: parent.verticalCenter
-                        // panel expands UPWARD, so open points up (▴), closed points right (▸)
-                        text: root.cbExpanded ? "▴" : "▸"
+                        // closed = up (▴, "click to open upward"); open = down (▾, "click to
+                        // collapse") — mirrors the real motion of the panel opening/closing.
+                        text: root.cbExpanded ? "▾" : "▴"
                         color: root.colAccent; font.pixelSize: 18; font.bold: true
                         z: 1
                     }
