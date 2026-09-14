@@ -22,12 +22,12 @@ ShellRoot {
     property bool shown: true
     property bool pinned: true            // pinned = reserve screen space (windows tile beside it)
     property int  panelWidth: 480         // fits 8 launcher buttons + `+` on one row; widen via IPC `widen`
-    property int  caeBar: 0               // Left inset for Caelestia's vertical bar. Hyprland's
-                                          // exclusive-zone layout ALREADY positions this window to the
-                                          // right of Caelestia's reserved bar zone, so no manual inset is
-                                          // needed — a non-zero value just paints a black strip to the
-                                          // LEFT of the bar (the ~1cm gap). Kept as a knob at 0; raise
-                                          // only if a future layout genuinely overlaps the bar.
+    property int  caeBar: 0               // Left inset for Caelestia's vertical bar. On the Top layer
+                                          // Hyprland's exclusive-zone layout ALREADY positions this window
+                                          // to the right of Caelestia's reserved bar zone, so no manual
+                                          // inset is needed — a non-zero value just paints a dead black
+                                          // strip to the LEFT (the ~1cm gap bug). Keep at 0 on Top.
+                                          // Drives implicitWidth / exclusiveZone / mask / bg margin.
     property int  scallop: 18             // concave corner radius = Hyprland decoration:rounding
     property int  edgeGap: 10             // = Hyprland general:gaps_out; the negative win.margins
                                           // that cancel the gap make win 2*edgeGap taller than the
@@ -96,13 +96,21 @@ ShellRoot {
         } else {
             voiceBuf = "";
             root.voiceOn = true;
+            // Process.running is edge-triggered; after a hot-reload / restart it can
+            // be stuck true (a plain =true is then a no-op that never respawns). Force
+            // a false→true edge so the recorder always actually starts.
+            if (voiceProc.running) voiceProc.running = false;
             voiceProc.running = true;
         }
     }
     property string voiceBuf: ""
     Process {
         id: voiceProc
-        command: ["sh", "-lc", "flyout-dictate 2>/dev/null"]
+        // trap 'kill 0': when Quickshell kills this sh, the trap reaps the whole
+        // process group (pw-record + whisper) so no orphaned recorder is left
+        // holding the capture source — which would make the NEXT mic press record
+        // silence. Quickshell doesn't reap grandchildren, so this wrapper must.
+        command: ["sh", "-lc", "trap 'kill 0' EXIT INT TERM; flyout-dictate 2>/dev/null"]
         stdout: SplitParser {
             splitMarker: "\n"
             onRead: function(seg) {
@@ -615,19 +623,24 @@ ShellRoot {
         mask: Region { x: root.caeBar; y: 0; width: root.panelWidth; height: win.height }
 
         WlrLayershell.namespace: "openclaw-sidebar"
+        // Top layer. NOTE: WlrLayer.Bottom does NOT work here — a Bottom-layer
+        // wlr-layer-shell surface with a non-zero exclusiveZone never maps under
+        // Hyprland (zero geometry, invisible). So we stay on Top and keep the
+        // flyout clear of Caelestia's bar/pop-out region via the `caeBar` left
+        // inset instead: the panel simply doesn't overlap that strip, so
+        // Caelestia's pop-outs (vol/mic/network/BT + tray menus) render beside/in
+        // front of it without any z-order trick (the `order` layerrule is dead on
+        // 0.56.2's non-legacy parser anyway).
         WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
 
-        // Startup restack DISABLED. Caelestia's bar and its pop-out drawers are ONE
-        // full-screen surface on the `top` layer; for its pop-outs (vol/mic/network/BT
-        // and tray menus) to paint in FRONT of the flyout, the flyout must sit below that
-        // surface. NOTE: the Hyprland `order` layerrule does NOT work on this setup
-        // (0.56.2 non-legacy parser — the field is silently ignored, verified in
-        // `hyprctl layers -j`), and map-order restacking is fragile (a reload re-maps the
-        // flyout last → back on top → pop-outs hidden) AND can wedge Quickshell's surface.
-        // No reliable pure-layering fix exists here; the flyout is width-shifted right of
-        // the bar column instead so it never overlaps the pop-out region. This unmap→remap
-        // restack is the old approach, left here disabled purely for easy revert.
+        // Startup restack DISABLED — replaced by a Hyprland `order = -1` layerrule (see
+        // install.sh / hyprland.lua). Caelestia's bar and its pop-out drawers are ONE
+        // full-screen surface on the `top` layer, so we must sit BELOW that whole surface
+        // for its pop-outs to paint in FRONT of the flyout. Relying on map-order alone was
+        // fragile (a reload re-maps the flyout last → back on top → pop-outs hidden); the
+        // `order` layerrule pins us under it deterministically. This unmap→remap restack is
+        // the old approach, left here disabled purely for easy revert.
         Timer {
             id: restackTimer
             interval: 2500; running: false; repeat: true
