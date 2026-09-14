@@ -22,11 +22,12 @@ ShellRoot {
     property bool shown: true
     property bool pinned: true            // pinned = reserve screen space (windows tile beside it)
     property int  panelWidth: 480         // fits 8 launcher buttons + `+` on one row; widen via IPC `widen`
-    property int  caeBar: 60              // Caelestia's left vertical bar width. The flyout now sits
-                                          // BELOW Caelestia's drawer surface (so its pop-outs paint in
-                                          // FRONT of us), which means that bar shows through on the left.
-                                          // We inset our content right by caeBar so the bar tucks into
-                                          // that strip instead of eating the flyout's left edge.
+    property int  caeBar: 0               // Left inset for Caelestia's vertical bar. Hyprland's
+                                          // exclusive-zone layout ALREADY positions this window to the
+                                          // right of Caelestia's reserved bar zone, so no manual inset is
+                                          // needed — a non-zero value just paints a black strip to the
+                                          // LEFT of the bar (the ~1cm gap). Kept as a knob at 0; raise
+                                          // only if a future layout genuinely overlaps the bar.
     property int  scallop: 18             // concave corner radius = Hyprland decoration:rounding
     property int  edgeGap: 10             // = Hyprland general:gaps_out; the negative win.margins
                                           // that cancel the gap make win 2*edgeGap taller than the
