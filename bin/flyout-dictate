@@ -1,45 +1,140 @@
 #!/usr/bin/env bash
 # flyout-dictate — local push-to-talk dictation for the OpenClaw flyout mic button.
-# While running (mic armed), records the default PipeWire source in short chunks,
-# transcribes each locally with whisper.cpp, and prints the transcribed text — one
-# utterance per line — to stdout. The flyout appends each line into the input box.
-# Toggling the mic off kills this process (SIGTERM), which stops cleanly.
-
+# While running (mic armed), records the default PipeWire source CONTINUOUSLY and
+# transcribes locally with whisper.cpp, printing text — one utterance per line — to
+# stdout. The flyout appends each line into the input box. Toggling the mic off kills
+# this process group (SIGTERM), which stops cleanly.
+#
+# Design (fixes "pauses stop listening / chunks missing"):
+#   * pw-record writes to a REAL growing file — it never blocks, so capture never
+#     pauses (the old FIFO version stalled the recorder whenever whisper ran, and a
+#     synchronous transcribe in the read loop dropped every pause).
+#   * A separate reader consumes the capture file in GAPLESS, OVERLAPPING windows:
+#     each frame carries OVERLAP seconds of the previous frame's tail, so a word
+#     spoken across a boundary is still whole in one of the two frames.
+#   * De-dup collapses the repeated overlap text so you don't see words twice.
 set -u
+
 WCPP="$HOME/.local/share/whisper.cpp"
 WH="$WCPP/build/bin/whisper-cli"
-MODEL="$WCPP/models/ggml-base.en.bin"
-CHUNK=4            # seconds per capture window
+MODEL="$WCPP/models/ggml-small.en.bin"          # accurate; fall back if missing
+[ -f "$MODEL" ] || MODEL="$WCPP/models/ggml-base.en.bin"
+VADMODEL="$WCPP/models/ggml-silero-v5.1.2.bin"  # optional; enables --vad if present
+
+WINDOW=6            # seconds of audio transcribed per frame
+OVERLAP=1           # seconds of the previous frame re-included (boundary safety)
+RATE=16000          # whisper native sample rate
+BPS=$((RATE * 2))                       # s16 mono = 2 bytes/sample
+FRAME_BYTES=$((BPS * WINDOW))
+STEP_BYTES=$((BPS * (WINDOW - OVERLAP)))  # advance per frame (gapless, overlapping)
+
 TMP="$(mktemp -d /tmp/flyout-dictate.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+CAP="$TMP/cap.raw"                       # continuous capture, grows forever
+REC_PID=""
+# Kill only the recorder + any whisper child by name — NOT `kill 0`, which signals
+# our own (trapped, dying) bash and segfaults it under `timeout`/SIGTERM.
+cleanup() {
+  [ -n "$REC_PID" ] && kill "$REC_PID" 2>/dev/null
+  pkill -P $$ 2>/dev/null
+  rm -rf "$TMP"
+}
+trap cleanup EXIT INT TERM
 
 if [ ! -x "$WH" ] || [ ! -f "$MODEL" ]; then
   echo "[voice: whisper.cpp not installed]"
   exit 1
 fi
 
-# clean whisper output: strip [timestamps], blank/■ noise lines, leading spaces
+# Minimal WAV header for RATE/16-bit/mono with a given data length (bytes).
+wav_header() {
+  python3 - "$1" "$RATE" <<'PY'
+import sys,struct
+dlen,rate=int(sys.argv[1]),int(sys.argv[2])
+total=36+dlen; byte_rate=rate*2
+sys.stdout.buffer.write(b'RIFF'+struct.pack('<I',total)+b'WAVEfmt '
+  +struct.pack('<IHHIIHH',16,1,1,rate,byte_rate,2,16)+b'data'+struct.pack('<I',dlen))
+PY
+}
+
+# clean whisper output: strip [timestamps]/(parens), noise lines, hallucinations.
 clean() {
   sed -E 's/\[[0-9:.[:space:]>-]+\]//g' \
     | sed -E 's/\(([^)]*)\)//g; s/\[[^]]*\]//g' \
     | tr -d '\r' \
     | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' \
     | grep -vE '^$' \
-    | grep -viE '^(\[?BLANK_AUDIO\]?|\[?INAUDIBLE\]?|\[?silence\]?|you|thanks for watching\.?|\.)$'
+    | grep -viE '^(\[?BLANK_AUDIO\]?|\[?INAUDIBLE\]?|\[?silence\]?|you|thank you\.?|thanks for watching\.?|\.|\.\.\.|so|uh|um)$'
 }
 
+#  -sns suppress non-speech tokens · -nf no temp fallback · beam search kept for quality.
+#  NB: VAD is deliberately NOT used per-frame — it adds ~4s encode latency per window
+#  (too slow for live dictation) and crashed on short tail frames; the OVERLAP window
+#  already prevents boundary word-loss, so VAD buys nothing here.
+WFLAGS=(-m "$MODEL" -nt -np -sns -nf -t "$(nproc)" --prompt "Casual English dictation.")
+
+transcribe() {
+  "$WH" "${WFLAGS[@]}" -f "$1" 2>/dev/null \
+    | clean | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+# Drop the leading words of $2 that already appeared at the tail of $1 (overlap de-dup).
+dedup() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+prev=sys.argv[1].split(); cur=sys.argv[2].split()
+if not cur: sys.exit(0)
+# find longest suffix of prev that is a prefix of cur (up to 8 words)
+best=0
+for k in range(min(8,len(prev),len(cur)),0,-1):
+    if [w.lower() for w in prev[-k:]]==[w.lower() for w in cur[:k]]:
+        best=k; break
+print(" ".join(cur[best:]).strip())
+PY
+}
+
+# Continuous recorder → real file (never blocks, so capture never pauses).
+# Record the REAL hardware mic BY NAME, not the default source: the default is
+# the EasyEffects virtual node (easyeffects_source), which goes silent whenever
+# EasyEffects is restarting / unwired (boot/resume) — that silently killed
+# dictation while the mic itself was fine. MIC_SRC pins us to the real device.
+# Override with FLYOUT_DICTATE_SRC=<node.name> if the preferred mic changes.
+MIC_SRC="${FLYOUT_DICTATE_SRC:-alsa_input.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.mono-fallback}"
+# Fall back to the default source if that exact node isn't present right now.
+if ! pactl list short sources 2>/dev/null | grep -qF "$MIC_SRC"; then
+  MIC_SRC=""
+fi
+if [ -n "$MIC_SRC" ]; then
+  pw-record --target "$MIC_SRC" --rate "$RATE" --channels 1 --format s16 --raw "$CAP" >/dev/null 2>&1 &
+else
+  pw-record --rate "$RATE" --channels 1 --format s16 --raw "$CAP" >/dev/null 2>&1 &
+fi
+REC_PID=$!
+
+# Reader: wait until FRAME_BYTES available from `off`, transcribe that window, advance
+# by STEP_BYTES (leaving OVERLAP seconds re-read in the next frame).
+off=0
+prev=""
 while true; do
-  WAV="$TMP/clip.wav"
-  # record CHUNK seconds, 16kHz mono (whisper's native rate) from default source
-  timeout $((CHUNK + 1)) pw-record --rate 16000 --channels 1 --format s16 "$WAV" >/dev/null 2>&1 &
-  rec=$!
-  sleep "$CHUNK"
-  kill "$rec" 2>/dev/null
-  wait "$rec" 2>/dev/null
-  [ -s "$WAV" ] || continue
-  # transcribe this chunk; -nt no timestamps, -np no progress, single thread-friendly
-  TXT="$("$WH" -m "$MODEL" -f "$WAV" -nt -np -t "$(nproc)" 2>/dev/null | clean | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
-  if [ -n "$TXT" ]; then
-    echo "$TXT"
+  have=$(stat -c%s "$CAP" 2>/dev/null || echo 0)
+  if [ "$((have - off))" -lt "$FRAME_BYTES" ]; then
+    sleep 0.3
+    # if the recorder died (mic toggled off), flush the last partial frame and stop.
+    if ! kill -0 "$REC_PID" 2>/dev/null; then
+      rem=$((have - off))
+      if [ "$rem" -gt "$BPS" ]; then
+        wav="$TMP/last.wav"; { wav_header "$rem"; tail -c +"$((off+1))" "$CAP" | head -c "$rem"; } > "$wav"
+        TXT="$(transcribe "$wav")"; TXT="$(dedup "$prev" "$TXT")"
+        [ -n "$TXT" ] && echo "$TXT"
+      fi
+      break
+    fi
+    continue
   fi
+  wav="$TMP/frame.wav"
+  { wav_header "$FRAME_BYTES"; tail -c +"$((off+1))" "$CAP" | head -c "$FRAME_BYTES"; } > "$wav"
+  RAW_TXT="$(transcribe "$wav")"
+  TXT="$(dedup "$prev" "$RAW_TXT")"
+  [ -n "$TXT" ] && echo "$TXT"
+  prev="$RAW_TXT"
+  off=$((off + STEP_BYTES))
 done
