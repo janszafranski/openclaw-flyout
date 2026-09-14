@@ -93,10 +93,6 @@ hl.exec_cmd("bash $HOME/.local/bin/start-openclaw-sidebar.sh")
 hl.exec_cmd("bash $HOME/.local/bin/start-openclaw-tray.sh")
 hl.bind(mod .. " + O", hl.dsp.exec_cmd("qs -c openclaw-sidebar ipc call sidebar toggle"), { description = "OpenClaw flyout" })
 hl.layer_rule({ name = "openclaw-flyout-noblur", match = { namespace = "openclaw-sidebar" }, blur = false })
--- Stack the flyout below other shells' bar/drawer surfaces on the top layer so
--- their pop-outs always paint in FRONT of the flyout (deterministic, survives
--- reloads — no fragile map-order restack). Harmless if you run no other bar.
-hl.layer_rule({ match = { namespace = "openclaw-sidebar" }, order = -1 })
 $MARK_B
 EOF
     command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1 || true

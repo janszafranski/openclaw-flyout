@@ -618,13 +618,16 @@ ShellRoot {
         WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
 
-        // Startup restack DISABLED — replaced by a Hyprland `order = -1` layerrule (see
-        // install.sh / hyprland.lua). Caelestia's bar and its pop-out drawers are ONE
-        // full-screen surface on the `top` layer, so we must sit BELOW that whole surface
-        // for its pop-outs to paint in FRONT of the flyout. Relying on map-order alone was
-        // fragile (a reload re-maps the flyout last → back on top → pop-outs hidden); the
-        // `order` layerrule pins us under it deterministically. This unmap→remap restack is
-        // the old approach, left here disabled purely for easy revert.
+        // Startup restack DISABLED. Caelestia's bar and its pop-out drawers are ONE
+        // full-screen surface on the `top` layer; for its pop-outs (vol/mic/network/BT
+        // and tray menus) to paint in FRONT of the flyout, the flyout must sit below that
+        // surface. NOTE: the Hyprland `order` layerrule does NOT work on this setup
+        // (0.56.2 non-legacy parser — the field is silently ignored, verified in
+        // `hyprctl layers -j`), and map-order restacking is fragile (a reload re-maps the
+        // flyout last → back on top → pop-outs hidden) AND can wedge Quickshell's surface.
+        // No reliable pure-layering fix exists here; the flyout is width-shifted right of
+        // the bar column instead so it never overlaps the pop-out region. This unmap→remap
+        // restack is the old approach, left here disabled purely for easy revert.
         Timer {
             id: restackTimer
             interval: 2500; running: false; repeat: true
