@@ -22,6 +22,11 @@ ShellRoot {
     property bool shown: true
     property bool pinned: true            // pinned = reserve screen space (windows tile beside it)
     property int  panelWidth: 480         // fits 8 launcher buttons + `+` on one row; widen via IPC `widen`
+    property int  caeBar: 60              // Caelestia's left vertical bar width. The flyout now sits
+                                          // BELOW Caelestia's drawer surface (so its pop-outs paint in
+                                          // FRONT of us), which means that bar shows through on the left.
+                                          // We inset our content right by caeBar so the bar tucks into
+                                          // that strip instead of eating the flyout's left edge.
     property int  scallop: 18             // concave corner radius = Hyprland decoration:rounding
     property int  edgeGap: 10             // = Hyprland general:gaps_out; the negative win.margins
                                           // that cancel the gap make win 2*edgeGap taller than the
@@ -592,7 +597,7 @@ ShellRoot {
         color: "transparent"
         // extra `scallop` px on the right so the concave corner fillets can overhang the
         // desktop and give IT rounded corners. exclusiveZone still reserves only panelWidth.
-        implicitWidth: root.panelWidth + root.scallop
+        implicitWidth: root.caeBar + root.panelWidth + root.scallop
 
         anchors { left: true; top: true; bottom: true }
         // Cancel Hyprland's gaps_out (10px). Hyprland insets anchored layer-shell
@@ -602,21 +607,26 @@ ShellRoot {
         // the three anchored edges pull the surface back flush to the screen edges.
         // If gaps_out changes, match it here.
         margins { top: -10; bottom: -10; left: -10 }
-        exclusiveZone: root.pinned ? root.panelWidth : 0
-        // input only over the real panel; the overhang strip stays click-through to the desktop
-        mask: Region { x: 0; y: 0; width: root.panelWidth; height: win.height }
+        exclusiveZone: root.pinned ? root.caeBar + root.panelWidth : 0
+        // input only over the real panel; the caeBar strip on the left stays click-through so
+        // Caelestia's bar underneath keeps receiving clicks, and the overhang strip on the right
+        // stays click-through to the desktop.
+        mask: Region { x: root.caeBar; y: 0; width: root.panelWidth; height: win.height }
 
         WlrLayershell.namespace: "openclaw-sidebar"
         WlrLayershell.layer: WlrLayer.Top
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
 
-        // Startup restack: the flyout autostarts before Caelestia's bar, and both live on the
-        // `top` layer where z-order = map order — so the bar maps last and overlays us. Briefly
-        // unmap→remap a couple of times over the first few seconds (after the bar has mapped) to
-        // jump back to the top of the layer. This is the automated version of "close and reopen".
+        // Startup restack DISABLED (was: jump above Caelestia's bar). Caelestia's bar and its
+        // pop-out drawers are ONE full-screen surface on the `top` layer, so restacking above the
+        // bar also put us above the pop-outs — which then appeared BEHIND the flyout. We now
+        // deliberately sit BELOW Caelestia's surface: the flyout autostarts before Caelestia, so
+        // with no restack Caelestia's surface maps last and stays above us → its pop-outs paint in
+        // FRONT of the flyout (what we want). The trade-off (Caelestia's 60px left bar showing over
+        // our left edge) is handled by the caeBar inset above. Left here, disabled, for easy revert.
         Timer {
             id: restackTimer
-            interval: 2500; running: true; repeat: true
+            interval: 2500; running: false; repeat: true
             onTriggered: {
                 root.remapping = true;
                 unmapTimer.restart();
@@ -634,7 +644,7 @@ ShellRoot {
         //     fillets below so the adjacent desktop appears to have 18px rounded corners ---
         Rectangle {
             id: bg
-            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+            anchors { left: parent.left; leftMargin: root.caeBar; top: parent.top; bottom: parent.bottom }
             width: root.panelWidth
             color: root.colBg
             // no border: the 1px grey edge showed as a pale line along the bottom/right
