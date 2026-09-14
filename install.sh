@@ -36,6 +36,27 @@ for f in openclaw-cli-chat.sh openclaw-dashboard.sh start-openclaw-sidebar.sh; d
 done
 mkdir -p "$HOME/.config/quickshell/openclaw-sidebar"
 cp -r "$SELF/quickshell/openclaw-sidebar/." "$HOME/.config/quickshell/openclaw-sidebar/"
+
+# --- tray applet (optional "AI" taskbar icon that opens/closes the flyout) ----
+# Deployed as a self-contained dir so its icons resolve relative to the script.
+if [[ -f "$SELF/tray/openclaw-flyout-tray" ]]; then
+  log "Deploying the flyout tray applet"
+  TRAY_DIR="$HOME/.local/share/openclaw-flyout/tray"
+  mkdir -p "$TRAY_DIR"
+  cp -r "$SELF/tray/." "$TRAY_DIR/"
+  chmod +x "$TRAY_DIR/openclaw-flyout-tray"
+  # Guard launcher: dedup so a repeat autostart fire won't spawn a second tray.
+  install -Dm755 /dev/stdin "$HOME/.local/bin/start-openclaw-tray.sh" <<EOF
+#!/usr/bin/env bash
+# Launch guard for the OpenClaw flyout tray. No-op if already running. Matches
+# on the interpreter+script in /proc (never pkill/pgrep -f — self-matches).
+for p in /proc/[0-9]*/cmdline; do
+  if tr '\0' ' ' < "\$p" 2>/dev/null | grep -q 'openclaw-flyout-tray'; then exit 0; fi
+done
+export WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-wayland-1}"
+setsid "$TRAY_DIR/openclaw-flyout-tray" >/tmp/openclaw-tray.log 2>&1 &
+EOF
+fi
 # seed shortcuts.json from the example only if the user has none yet (never clobber)
 if [[ ! -f "$HOME/.config/quickshell/openclaw-sidebar/shortcuts.json" \
       && -f "$HOME/.config/quickshell/openclaw-sidebar/shortcuts.json.example" ]]; then
@@ -69,6 +90,7 @@ $MARK_A
 -- Launch via a guard script (starts one panel; no-ops if already running) so a
 -- repeated hyprland.start fire can't spawn duplicate overlapping panels.
 hl.exec_cmd("bash $HOME/.local/bin/start-openclaw-sidebar.sh")
+hl.exec_cmd("bash $HOME/.local/bin/start-openclaw-tray.sh")
 hl.bind(mod .. " + O", hl.dsp.exec_cmd("qs -c openclaw-sidebar ipc call sidebar toggle"), { description = "OpenClaw flyout" })
 hl.layer_rule({ name = "openclaw-flyout-noblur", match = { namespace = "openclaw-sidebar" }, blur = false })
 $MARK_B
