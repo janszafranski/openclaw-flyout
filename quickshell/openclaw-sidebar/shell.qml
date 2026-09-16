@@ -127,6 +127,58 @@ ShellRoot {
         }
     }
 
+    // --- file attachments (paperclip + drag-and-drop) -----------------------
+    // Chosen files are held as absolute paths in `attachments` and shown as chips
+    // above the input. On send we fold them into the message text as
+    // "[attached: /abs/path]" lines — the agent has full filesystem access here, so
+    // a path reference is all it needs to read the file with its own tools (no
+    // bridge/protocol change, works for any file type or size). The 📎 button opens
+    // the native GTK file chooser (zenity, already present on this box); files can
+    // also be dropped straight onto the input area.
+    property var attachments: []          // array of absolute path strings
+    function addAttachment(path) {
+        var p = (path || "").trim();
+        if (p.length === 0) return;
+        // strip a file:// URI prefix (drag-and-drop hands us URIs) + URL-decode
+        if (p.indexOf("file://") === 0) p = decodeURIComponent(p.substring(7));
+        // dedupe
+        for (var i = 0; i < root.attachments.length; i++)
+            if (root.attachments[i] === p) return;
+        var next = root.attachments.slice();
+        next.push(p);
+        root.attachments = next;
+    }
+    function removeAttachment(idx) {
+        var next = root.attachments.slice();
+        next.splice(idx, 1);
+        root.attachments = next;
+    }
+    function clearAttachments() { root.attachments = []; }
+    function baseName(p) {
+        var s = (p || "").replace(/\/+$/, "");
+        var i = s.lastIndexOf("/");
+        return i >= 0 ? s.substring(i + 1) : s;
+    }
+    // zenity prints the chosen path(s) to stdout; --multiple separates with "|".
+    Process {
+        id: pickerProc
+        command: ["sh", "-lc", "zenity --file-selection --multiple --title='Attach files' 2>/dev/null"]
+        stdout: SplitParser {
+            splitMarker: "\n"
+            onRead: function(seg) {
+                var line = (seg || "").trim();
+                if (line.length === 0) return;
+                var parts = line.split("|");
+                for (var i = 0; i < parts.length; i++) root.addAttachment(parts[i]);
+            }
+        }
+    }
+    function openPicker() {
+        // force a false→true edge (Process.running is edge-triggered, see voiceProc)
+        if (pickerProc.running) pickerProc.running = false;
+        pickerProc.running = true;
+    }
+
     Timer {
         interval: 1000; repeat: true; running: root.busy
         onTriggered: root.elapsed += 1
@@ -567,7 +619,17 @@ ShellRoot {
 
     function sendMessage(text) {
         var t = (text || "").trim();
-        if (t.length === 0) return;
+        // allow an attachment-only send (no typed text) as long as files are attached
+        if (t.length === 0 && root.attachments.length === 0) return;
+        // Fold any attached file paths into the outgoing message as path mentions.
+        // The agent reads them with its own file tools (path-reference delivery).
+        if (root.attachments.length > 0) {
+            var lines = [];
+            for (var i = 0; i < root.attachments.length; i++)
+                lines.push("[attached: " + root.attachments[i] + "]");
+            t = (t.length > 0 ? t + "\n\n" : "") + lines.join("\n");
+            root.clearAttachments();
+        }
         // The user just sent — always follow to the bottom, even if they'd
         // scrolled up to read history (which would have cleared stickToBottom).
         if (typeof list !== "undefined") list.stickToBottom = true;
@@ -1114,20 +1176,110 @@ ShellRoot {
                 Rectangle {
                     Layout.fillWidth: true
                     color: root.colHeader
-                    implicitHeight: inputRow.implicitHeight + 16
-                    RowLayout {
-                        id: inputRow
+                    implicitHeight: inputCol.implicitHeight + 16
+
+                    ColumnLayout {
+                        id: inputCol
                         anchors.fill: parent
                         anchors.margins: 8
+                        spacing: 6
+
+                        // ---- attachment chips (only visible when files are attached) ----
+                        Flow {
+                            id: chipRow
+                            Layout.fillWidth: true
+                            spacing: 6
+                            visible: root.attachments.length > 0
+                            Repeater {
+                                model: root.attachments
+                                delegate: Rectangle {
+                                    radius: 8
+                                    color: root.colUserBub
+                                    border.color: root.colBorder
+                                    border.width: 1
+                                    implicitHeight: 24
+                                    implicitWidth: chipContent.implicitWidth + 14
+                                    RowLayout {
+                                        id: chipContent
+                                        anchors.centerIn: parent
+                                        spacing: 5
+                                        Label {
+                                            text: "📎 " + root.baseName(modelData)
+                                            color: root.colText
+                                            font.pixelSize: 12
+                                            elide: Text.ElideMiddle
+                                            Layout.maximumWidth: 220
+                                        }
+                                        Label {
+                                            text: "✕"
+                                            color: root.colSubtle
+                                            font.pixelSize: 12
+                                            MouseArea {
+                                                anchors.fill: parent
+                                                anchors.margins: -4
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: root.removeAttachment(index)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                    RowLayout {
+                        id: inputRow
+                        Layout.fillWidth: true
                         spacing: 8
+
+                        // ---- 📎 attach button (leftmost, just before the prompt box) ----
+                        Rectangle {
+                            id: attachBtn
+                            Layout.preferredWidth: 40
+                            Layout.preferredHeight: 40
+                            radius: 10
+                            color: attachMa.containsMouse ? root.colUserBub : "transparent"
+                            border.color: root.colBorder
+                            border.width: 1
+                            Label {
+                                anchors.centerIn: parent
+                                text: "📎"
+                                font.pixelSize: 18
+                                color: root.colText
+                            }
+                            MouseArea {
+                                id: attachMa
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.openPicker()
+                            }
+                        }
 
                         Rectangle {
                             Layout.fillWidth: true
                             radius: 10
                             color: root.colInputBg
-                            border.color: input.activeFocus ? root.colAccent : root.colBorder
+                            border.color: dropArea.containsDrag ? root.colAccent : (input.activeFocus ? root.colAccent : root.colBorder)
                             border.width: 1
                             implicitHeight: Math.min(Math.max(input.implicitHeight + 14, 40), 160)
+
+                            // ---- drag-and-drop: drop files anywhere on the input box ----
+                            DropArea {
+                                id: dropArea
+                                anchors.fill: parent
+                                onDropped: function(drop) {
+                                    if (drop.hasUrls) {
+                                        for (var i = 0; i < drop.urls.length; i++)
+                                            root.addAttachment("" + drop.urls[i]);
+                                        drop.accepted = true;
+                                    } else if (drop.hasText) {
+                                        // some sources hand a newline/space list of paths as text
+                                        var parts = ("" + drop.text).split(/[\r\n]+/);
+                                        for (var j = 0; j < parts.length; j++) root.addAttachment(parts[j]);
+                                        drop.accepted = true;
+                                    }
+                                }
+                            }
 
                             ScrollView {
                                 anchors.fill: parent
@@ -1160,7 +1312,7 @@ ShellRoot {
 
                         Button {
                             text: "Send"
-                            enabled: input.text.trim().length > 0
+                            enabled: input.text.trim().length > 0 || root.attachments.length > 0
                             onClicked: { root.sendMessage(input.text); input.clear(); }
                             contentItem: Label {
                                 text: parent.text
@@ -1232,6 +1384,7 @@ ShellRoot {
                                 onClicked: root.toggleVoice()
                             }
                         }
+                    }
                     }
                 }
 
