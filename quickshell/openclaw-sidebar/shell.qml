@@ -654,8 +654,14 @@ ShellRoot {
             "messages": [{ "role": "user", "content": t }],
             "stream": true
         });
-        // curl -N = unbuffered; payload passed as a single argv (no shell, no quoting issues)
+        // curl -N = unbuffered; payload passed as a single argv (no shell, no quoting issues).
+        // --retry-connrefused + --retry: if the bridge is momentarily down (e.g. a
+        // restart to apply a fix, or a blip), wait it out silently instead of
+        // showing a dead "Can't reach the bridge" screen. ~5 tries over ~10s covers
+        // a bridge restart; --retry-all-errors so transient 5xx/refusals also retry.
         chatProc.command = ["curl", "-N", "-s", "-X", "POST",
+            "--retry", "5", "--retry-connrefused", "--retry-delay", "2",
+            "--retry-all-errors",
             root.base + "/v1/chat/completions",
             "-H", "Content-Type: application/json",
             "-d", payload];
