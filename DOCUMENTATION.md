@@ -13,9 +13,10 @@ Two processes, one clean HTTP contract between them:
 
 ```
 ┌─────────────────────────┐        HTTP (127.0.0.1:8787)        ┌──────────────────────┐
-│  Quickshell panel        │  ── GET  /history?session=…  ────▶ │  openclaw-ai-bridge  │
-│  (shell.qml)             │  ── GET  /sessions           ────▶ │  (Node)              │
-│  view + input + IPC      │  ── POST /v1/chat/completions ───▶ │  data + turn exec    │
+│  Quickshell panel        │  ── GET  /history/version?…  ────▶ │  openclaw-ai-bridge  │
+│  (shell.qml)             │  ── GET  /history?session=…  ────▶ │  (Node)              │
+│  view + input + IPC      │  ── GET  /sessions           ────▶ │  data + turn exec    │
+│                          │  ── POST /v1/chat/completions ───▶ │                      │
 └─────────────────────────┘  ◀──  SSE stream  ────────────────  └──────────┬───────────┘
                                                                             │
                                               openclaw acp / openclaw agent │  sqlite3 -readonly
@@ -83,8 +84,56 @@ bridge down. The startup line reports a count and the path only: logging the
 tokens would put them straight back into journald, which is the same mistake as
 having them in the source.
 
-### `GET /history?session=<key>`
-Returns `{ session, messages: [{role, content}, …] }`, already cleaned (see §1).
+`titleFor()` is **cached on `(sessionId, updatedAt)`** and reads only the first
+`OPENCLAW_BRIDGE_TITLE_HEAD_ROWS` (40) transcript rows — a title comes from the
+first human message, so reading past it is waste. A *configured flag* is the one
+exception: "does this topic dominate?" is a whole-transcript question, so a flag
+costs one full read — on a cache miss only, and never on the `/history` path.
+
+### `GET /history?session=<key>[&limit=N]`
+Returns `{ session, version, limit, messages: [{role, content}, …] }`, already
+cleaned (see §1).
+
+`limit` is the number of **newest** messages to return, default 200 (`limit=0` or
+`limit=all` for the whole transcript, capped at 5000). It is a window, not a page:
+there is no offset, because the panel only ever shows the recent end. On a real
+store this is the difference between a 3.45 MB response and a ~300 KB one.
+
+`version` is the session's highest transcript `seq`, read in the *same* `sqlite3`
+invocation as the rows, so it can never disagree with the messages beside it.
+
+### `GET /history/version?session=<key>`
+Returns `{ session, version }` and nothing else — 49 bytes, one indexed query
+(`MAX(seq)` over the `(session_id, seq)` primary key), no CLI spawn. This is what
+makes the panel's poll conditional; see §4. An unresolvable key is `version: -1`,
+not an error: a chat with no transcript yet is a normal state.
+
+### Caching
+
+`openclaw sessions list --json` is the only way to map a session *key* to the
+`sessionId` the transcript table is keyed by, and it costs **~2.1 s** because it
+boots a whole CLI. Calling it per request is what made `/history` and `/sessions`
+cost ~2.3–2.6 s each.
+
+It is cached **stale-while-revalidate**, not with a plain TTL: a plain TTL still
+hands one poll tick in every TTL the full 2.1 s bill. A caller gets whatever is
+cached, immediately; a stale cache schedules a refresh in the background for the
+next caller. Only two things ever wait for the CLI — the first request after
+startup (nothing to serve yet), and a lookup for a key that is *not in* the cache
+(a chat created seconds ago), which is rate-limited to one spawn per
+`OPENCLAW_BRIDGE_INDEX_MISS_MS` so an always-absent key can't re-spawn it per
+poll. `GET /sessions?fresh=1` opts into waiting.
+
+| env var | default | what |
+|---|---|---|
+| `OPENCLAW_BRIDGE_HISTORY_LIMIT` | `200` | `/history` messages when `limit` is unset |
+| `OPENCLAW_BRIDGE_INDEX_TTL_MS` | `30000` | age at which the session index refreshes behind you |
+| `OPENCLAW_BRIDGE_INDEX_MISS_MS` | `3000` | min gap between CLI spawns for an unknown key |
+| `OPENCLAW_BRIDGE_TITLE_HEAD_ROWS` | `40` | transcript rows read for a drawer title |
+
+Every transcript read is `execFile`, never `execFileSync`. The bridge carries
+in-flight SSE streams; a synchronous read blocks the event loop, and therefore the
+stream, for as long as it takes.
 
 ## 3. Session continuity — the "it forgot what we were talking about" fix
 
@@ -102,14 +151,70 @@ never *persists* a throwaway/probe key as the last-open session (which would reo
 
 **The gateway writes a completed turn to the SQLite store only when the turn
 finishes — and replies routinely take a minute or two.** The store has no change
-notification. So the flyout **polls** `/history` every few seconds while the panel
-is shown (`refreshTimer`, `running: root.shown`). A reply that lands two minutes
-after you sent it appears within one poll interval.
+notification. So the flyout **polls** every few seconds while the panel is shown
+(`refreshTimer`, `running: root.shown`). A reply that lands two minutes after you
+sent it appears within one poll interval.
 
-`loadHistory()` diffs the fetched list against the current model and **no-ops when
-nothing changed**, so polling never causes a flash and costs only one small
-`sqlite3 -readonly` read per tick. The read is `-readonly` so it can never block or
-corrupt a concurrent gateway write.
+### What a tick costs
+
+A tick is **conditional**. `pollHistory()` asks `/history/version` first and only
+fetches a transcript body when that number moved. At rest, that 49-byte probe is
+the entire cost of a tick.
+
+This used to be an unbounded `GET /history` every 3 s. Measured on a real store
+(2601 messages), each tick was **3.45 MB and ~2.3 s**, spawning both the
+`openclaw` CLI and `sqlite3`, with the whole 3.4 MB re-parsed in the QML render
+thread and diffed against a 2601-row `ListModel` — while a 2.3 s response raced a
+3 s timer. An earlier version of this section claimed a tick cost "one small
+`sqlite3 -readonly` read"; it did not, and the flash / scroll-snap-back /
+"repeated chunks" work-arounds in `loadHistory()` were mostly fighting that.
+
+| | before | after |
+|---|---|---|
+| tick at rest | 3.45 MB, ~2.3 s | 49 B, ~10 ms |
+| tick with a new turn | 3.45 MB, ~2.3 s | ~300 KB, ~30 ms |
+| `GET /sessions` | 2.3–2.6 s | ~1 ms warm |
+| process spawns per tick | 2 | 1 (`sqlite3`), 0 CLI |
+
+The read is still `-readonly`, so it can never block or corrupt a concurrent
+gateway write.
+
+### Guards
+
+- **In-flight guard.** `loadHistory()` and the version probe each refuse to start
+  while their own request is outstanding. At 2.3 s per request against a 3 s timer
+  the old code already nearly overlapped itself. A request that never completes
+  goes stale after 20 s so a killed bridge can't wedge the poll permanently.
+- **`root.busy`.** The poll pauses while a turn streams: the store lacks the
+  in-progress reply (written only on completion), and the version must *not* be
+  recorded from a body fetched mid-turn, or the poll would stop looking for the
+  very turn it's waiting on. `settleTimer` holds it off for a few seconds
+  afterwards so the finished reply has flushed before the next diff.
+- **Version is per session.** `switchSession()`, `newChat()`, the `lock` and
+  `clear` IPC calls all reset it, so the next tick always fetches a body rather
+  than trusting a number that belonged to a different chat.
+
+### Reconciling a *window*
+
+Because `/history` now returns the newest 200 messages rather than everything,
+`reconcileHistory()` is **tail-anchored**, not prefix-anchored: once a chat is
+longer than the window, the window no longer starts where the model does, and
+prefix diffing would simply stop updating. It finds the offset at which the window
+lines up with the model's tail (longest overlap wins) and then:
+
+- window sits inside the model, nothing past it → **no change**. This is what
+  protects your just-typed prompt and the streamed reply from being cleared while
+  the store is still behind.
+- window lines up and extends past it → **append the tail only**, which leaves
+  scroll position untouched. A `clear()`+refill on every poll is what used to snap
+  you back to the bottom when you scrolled up.
+- nothing lines up → history genuinely diverged (session switch, an edit rewrote
+  it) → **rebuild**.
+- an empty window is a **no-op**, so a transient bridge failure can't blank a
+  conversation.
+
+`test/reconcile.test.js` covers these; it mirrors the QML function, so keep the
+two in sync. Run them with `make check`.
 
 ## 5. Scroll-to-bottom — the "it opened at the top" fix
 
@@ -171,6 +276,41 @@ a `Canvas` + `destination-out` arc, so the desktop *beside* the panel appears to
 have rounded corners. Header/footer strips and the scallop fillets are **fully
 opaque black** on purpose — at the body's ~80% alpha the desktop behind bled through
 as grey lines/curves. If you change `gaps_out`, match `edgeGap` in `shell.qml`.
+
+## 10. The keyboard claim — the "typing in the flyout opened the app launcher" fix
+
+The panel takes keyboard focus **on demand** (`WlrKeyboardFocus.OnDemand`): it gets the
+keyboard when you click into it, and never steals it just by being open. That is the correct
+setting, and it is still what the panel does.
+
+What it collides with is a desktop feature that assumes "no windows on this workspace" means
+"nobody is typing anywhere": the omarchy-launcher's *type-to-open* binds, which arm `a`–`z` and
+`0`–`9` while the workspace is bare so a plain letter opens the app launcher. A layer-shell
+panel is not a window, so the workspace still counted **zero** with this flyout open over it —
+and every character typed into the chat box also fired a bind, opening the launcher, which then
+took the keyboard and the rest of the sentence.
+
+Neither side could fix this alone. Hyprland's Lua API can report a layer's interactivity
+(`none` / `exclusive` / `on_demand`) but offers no way to ask *which* surface currently holds
+the keyboard, so the gate cannot tell an on-demand panel that has been clicked into from one
+sitting idle — and treating every on-demand panel as "busy" would have disabled type-to-open
+permanently, since this flyout is pinned open all day.
+
+So the panel that holds the keyboard says so, in a file:
+
+```
+$XDG_RUNTIME_DIR/omarchy-launcher.kb-claim    our layer namespace, or empty
+```
+
+`kbClaimProbe` in `shell.qml` watches `Window.active` — true exactly while the compositor has
+handed this surface the keyboard, driven by `wl_keyboard.enter`/`leave` — and writes or blanks
+the claim through `kbClaimFile`. The gate honours a claim only while a layer with that namespace
+is actually mapped, so dying while focused cannot leave type-to-open switched off for the rest
+of the session.
+
+The other end lives in `~/.config/hypr/hyprland.lua`, in the `>>> type-to-open >>>` block. The
+flyout has no dependency on it: with no launcher installed, the claim file is simply written and
+never read.
 
 ---
 

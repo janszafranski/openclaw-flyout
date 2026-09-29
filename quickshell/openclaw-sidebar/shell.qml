@@ -371,7 +371,10 @@ ShellRoot {
     }
     Timer {
         id: cbTimer
-        interval: 90000; repeat: true; running: true    // refresh every 90s while open
+        // Only while the panel is SHOWN, like refreshTimer. `running: true` meant
+        // this spawned `claudebar` every 90s for the whole login session, panel
+        // open or not, to refresh a strip nobody was looking at.
+        interval: 90000; repeat: true; running: root.shown
         triggeredOnStart: true
         onTriggered: { root.cbBuf = ""; cbProc.running = true; }
     }
@@ -412,6 +415,9 @@ ShellRoot {
 
     // On startup fetch history + recent chats. The bridge (systemd) may not be up
     // yet at login, so retry a few times until data arrives, then stop.
+    // This overlaps refreshTimer's triggeredOnStart if the panel opens at login;
+    // loadHistory()'s in-flight guard collapses that into one fetch (it used to be
+    // two concurrent 3.4 MB ones).
     property int bootTries: 0
     Timer {
         id: bootTimer
@@ -429,10 +435,14 @@ ShellRoot {
     // when the turn COMPLETES — and replies routinely take ~2 MINUTES. A short
     // burst after open therefore gave up long before the reply landed, so the
     // flyout showed the user's message but never the response. Instead, keep
-    // reloading every few seconds for as long as the panel is shown: a reply that
-    // finishes 2 min later appears within one poll interval. `loadHistory` diffs
-    // against the model and no-ops when unchanged, so this never flashes and is
-    // cheap (one small SQLite read). The poll only runs while `root.shown`.
+    // polling every few seconds for as long as the panel is shown: a reply that
+    // finishes 2 min later appears within one poll interval.
+    //
+    // A tick is CONDITIONAL — `pollHistory` asks /history/version (49 bytes, one
+    // indexed query) and only fetches a transcript body when that number moved.
+    // At rest that is the whole cost of a tick. It used to be an unbounded
+    // /history: 3.45 MB and ~2.3 s per tick, re-parsed in the render thread,
+    // which is what the flash/scroll-snap work-arounds below were really fighting.
     function reloadSoon() { root.loadHistory(root.currentSession); }
     Timer {
         id: refreshTimer
@@ -446,8 +456,8 @@ ShellRoot {
                                             // settleTimer holds the poll off briefly
                                             // after a turn so the just-finished reply
                                             // has flushed to SQLite before we diff.
-        triggeredOnStart: true         // reload immediately on show, then every 3s
-        onTriggered: root.loadHistory(root.currentSession)
+        triggeredOnStart: true         // poll immediately on show, then every 3s
+        onTriggered: root.pollHistory(root.currentSession)
     }
     // After a streamed turn ends, wait for the gateway to flush it to SQLite before
     // re-enabling the poll — otherwise the first post-turn diff wipes the reply that
@@ -474,10 +484,14 @@ ShellRoot {
             root.shown = true;
             root.pinned = true;
             root.currentSession = "agent:main:ai-flyout";
+            root.resetHistVersion();
             root.reloadSoon();   // burst-reload: the terminal's last turn may still be flushing to SQLite
         }
         function widen(): void  { root.panelWidth = (root.panelWidth >= 620 ? 480 : 620) }
-        function clear(): void  { chatModel.clear() }
+        // Emptying the model without forgetting the version would leave the poll
+        // (which only fetches a body when the version MOVES) with nothing to do,
+        // so the panel would stay blank until the next turn.
+        function clear(): void  { chatModel.clear(); root.resetHistVersion() }
         function reload(): void { root.loadHistory(root.currentSession); root.loadSessions() }  // re-sync after CLI edits
     }
 
@@ -517,71 +531,143 @@ ShellRoot {
     // dropped server-side in parseTranscript(). So this is a thin loader — no
     // client-side cleaning to keep in sync with the bridge.
 
-    function loadHistory(key) {
+    // How many messages to ask the bridge for. Unbounded used to mean a 3.45 MB
+    // body parsed in the render thread every 3 s on a long chat; this is a
+    // WINDOW on the newest messages, which is why the reconcile below is
+    // tail-anchored rather than prefix-anchored.
+    readonly property int histLimit: 200
+
+    // ---- poll bookkeeping --------------------------------------------------
+    // The poll first asks /history/version (49 bytes, one indexed query) and only
+    // fetches a body when the number moved. At rest that is the entire cost of a
+    // tick. Both requests carry an in-flight guard: at 2.3 s/req against a 3 s
+    // timer the old code already nearly overlapped itself, and a slower box or a
+    // bigger transcript piled requests up.
+    property bool histInFlight: false
+    property double histInFlightAt: 0
+    property bool verInFlight: false
+    property double verInFlightAt: 0
+    // Last version we actually APPLIED, and the session it belongs to. Cleared on
+    // a session switch so the next tick always fetches a body.
+    property int  histVersion: -1
+    property string histVersionKey: ""
+    // A request that never reaches DONE (bridge killed mid-response) must not
+    // wedge the guard forever.
+    readonly property int histStaleMs: 20000
+
+    function histBusy(flag, since) { return flag && (Date.now() - since) < root.histStaleMs; }
+
+    // Forget the cached version so the next poll re-fetches a body. Call whenever
+    // the session changes underneath us.
+    function resetHistVersion() { root.histVersion = -1; root.histVersionKey = ""; }
+
+    // Conditional poll tick: cheap version probe, body only when it changed.
+    function pollHistory(key) {
+        if (root.histVersionKey !== key) { root.loadHistory(key); return; }
+        if (root.histBusy(root.verInFlight, root.verInFlightAt)) return;
+        if (root.histBusy(root.histInFlight, root.histInFlightAt)) return;
+        root.verInFlight = true;
+        root.verInFlightAt = Date.now();
         var xhr = new XMLHttpRequest();
-        xhr.open("GET", root.base + "/history?session=" + encodeURIComponent(key));
+        xhr.open("GET", root.base + "/history/version?session=" + encodeURIComponent(key));
         xhr.onreadystatechange = function() {
-            if (xhr.readyState !== XMLHttpRequest.DONE || xhr.status !== 200) return;
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.verInFlight = false;
+            if (xhr.status !== 200) return;
             try {
                 var d = JSON.parse(xhr.responseText);
-                // Build the list first, then diff against what's already shown —
-                // only rebuild the model if it actually changed. The live poll
-                // fires loadHistory every few seconds; without this diff every
-                // call would clear()+refill and the panel would FLASH.
+                // Only the session we asked about, and only if it moved.
+                if (d.session === key && d.version !== root.histVersion) root.loadHistory(key);
+            } catch (e) { /* ignore */ }
+        };
+        xhr.send();
+    }
+
+    // Reconcile a WINDOW of the newest messages against chatModel. `next` and the
+    // model both end at "newest", but the model may hold optimistic rows the store
+    // hasn't got yet, and (once the chat is longer than histLimit) the window no
+    // longer starts where the model does. So find the offset at which the window
+    // lines up with the model's tail, then append only what's past it:
+    //   - window sits inside the model, nothing past it -> no change (store lags,
+    //     or we're already up to date). This is what protects the just-typed
+    //     prompt and the streamed reply from being clear()ed away.
+    //   - window lines up and extends past the model     -> append the tail only,
+    //     which leaves scroll position untouched. A clear()+refill of a 200-row
+    //     model resets the viewport on every poll — the "scroll up, snap back,
+    //     repeated chunks" bug.
+    //   - no alignment at all                            -> history genuinely
+    //     diverged (session switch, an edit rewrote it): clear() and refill.
+    // Returns true if the model changed.
+    function reconcileHistory(next) {
+        var c = chatModel.count;
+        var n = next.length;
+        if (c === 0) {
+            for (var f = 0; f < n; f++) chatModel.append(next[f]);
+            return n > 0;
+        }
+        // Snapshot the model once: ListModel.get() mints a JS wrapper per call, and
+        // the alignment search below is O(c*n) in the worst case. c reads, then
+        // plain string compares.
+        var cur = [];
+        for (var s = 0; s < c; s++) { var r = chatModel.get(s); cur.push(r.role); cur.push(r.content); }
+        // Smallest offset wins, which is the longest overlap, which is the most
+        // conservative read of "these are the same conversation".
+        for (var o = 0; o < c; o++) {
+            var overlap = Math.min(n, c - o);
+            var ok = true;
+            for (var i = 0; i < overlap; i++) {
+                if (cur[2 * (o + i)] !== next[i].role || cur[2 * (o + i) + 1] !== next[i].content) { ok = false; break; }
+            }
+            if (!ok) continue;
+            if (n <= overlap) return false;              // fully contained -> nothing new
+            for (var a = overlap; a < n; a++) chatModel.append(next[a]);
+            return true;
+        }
+        chatModel.clear();
+        for (var k = 0; k < n; k++) chatModel.append(next[k]);
+        return true;
+    }
+
+    function loadHistory(key) {
+        if (root.histBusy(root.histInFlight, root.histInFlightAt)) return;
+        root.histInFlight = true;
+        root.histInFlightAt = Date.now();
+        var xhr = new XMLHttpRequest();
+        xhr.open("GET", root.base + "/history?session=" + encodeURIComponent(key)
+                        + "&limit=" + root.histLimit);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            root.histInFlight = false;
+            if (xhr.status !== 200) return;
+            try {
+                var d = JSON.parse(xhr.responseText);
+                // A reply for a session we've since switched away from must not be
+                // applied to the one now on screen.
+                if (d.session !== key || key !== root.currentSession) return;
                 var next = [];
                 for (var i = 0; i < d.messages.length; i++) {
                     var m = d.messages[i];
                     next.push({ "role": m.role, "content": m.content });
                 }
-                // RESTORE-AFTER-RELOAD must win over the busy/shrink guards. If
-                // Quickshell hot-reloads mid-turn, a fresh empty model gets only the
-                // in-flight turn appended (~1-2 rows) while the store holds the WHOLE
-                // transcript. That's not the clobber case — it's the opposite — so we
-                // MUST adopt the store here even while busy. Detect it: the store has
-                // many MORE messages than we're showing. (Threshold 4 leaves headroom
-                // for a normal streaming turn's own rows.)
+                // RESTORE-AFTER-RELOAD must win over the busy guard. If Quickshell
+                // hot-reloads mid-turn, a fresh empty model gets only the in-flight
+                // turn appended (~1-2 rows) while the store holds the whole window.
+                // That's not the clobber case — it's the opposite — so we MUST adopt
+                // the store here even while busy. (Threshold 4 leaves headroom for a
+                // normal streaming turn's own rows.)
                 var restoring = (next.length >= chatModel.count + 4);
-                // NEVER clobber optimistic local state with a lagging store. The
-                // gateway writes a turn to SQLite only on completion, so between
-                // "user hits send" and "reply flushed" the store has FEWER messages
-                // than we're showing (the just-typed prompt + streaming reply live
-                // only in chatModel). Applying that snapshot would clear() them —
-                // that's why the question AND the prior reply vanished. So bail while
-                // a turn is in flight, and never shrink: only adopt the store when it
-                // has caught up (>= what we show). A genuine session SWITCH clears the
-                // model first, so count 0 there still loads fine. EXCEPT when we're
-                // restoring the full transcript after a reload (see above).
+                // Otherwise bail while a turn is in flight: the gateway writes a turn
+                // to SQLite only on completion, so between "user hits send" and "reply
+                // flushed" the store is BEHIND what we show. reconcileHistory() treats
+                // that as "contained, no change", but there is no point paying for the
+                // diff — and the version must NOT be recorded, or we'd stop polling
+                // for the very turn we're waiting on.
                 if (root.busy && !restoring) return;
-                if (next.length < chatModel.count) return;
-                var changed = (next.length !== chatModel.count);
-                if (!changed) {
-                    for (var j = 0; j < next.length; j++) {
-                        if (chatModel.get(j).role !== next[j].role ||
-                            chatModel.get(j).content !== next[j].content) { changed = true; break; }
-                    }
+                if (typeof d.version === "number") {
+                    root.histVersion = d.version;
+                    root.histVersionKey = key;
                 }
-                if (!changed) return;   // identical → no repaint, no flash
-                // APPEND-ONLY when the store is an unchanged PREFIX of what we show
-                // plus new rows at the end (the common poll case: a turn completed,
-                // a few rows added). A full clear()+refill of a ~1500-row model
-                // resets the viewport every poll — that's the "repeated chunks /
-                // can't scroll up" bug: scroll up, next poll rebuilds + snaps you
-                // back. So only clear() when the prefix genuinely diverged (session
-                // switch / an edit rewrote history); otherwise just append the tail,
-                // which leaves scroll position untouched.
-                var prefixMatches = (next.length > chatModel.count);
-                if (prefixMatches) {
-                    for (var p = 0; p < chatModel.count; p++) {
-                        if (chatModel.get(p).role !== next[p].role ||
-                            chatModel.get(p).content !== next[p].content) { prefixMatches = false; break; }
-                    }
-                }
-                if (prefixMatches) {
-                    for (var a = chatModel.count; a < next.length; a++) chatModel.append(next[a]);
-                } else {
-                    chatModel.clear();
-                    for (var k = 0; k < next.length; k++) chatModel.append(next[k]);
-                }
+                if (!root.reconcileHistory(next)) return;   // identical → no repaint, no flash
                 // Pin to newest ONLY if the user is already parked at the bottom
                 // (stickToBottom). If they scrolled up to read history, leave their
                 // viewport alone — a background poll must not drag them to the end.
@@ -596,6 +682,7 @@ ShellRoot {
     function switchSession(key) {
         root.currentSession = key;
         root.sessionsOpen = false;
+        root.resetHistVersion();   // the cached version belongs to the old chat
         // A deliberate switch should land on the newest message.
         if (typeof list !== "undefined") list.stickToBottom = true;
         root.loadHistory(key);
@@ -609,6 +696,7 @@ ShellRoot {
     function newChat() {
         root.currentSession = "agent:main:flyout-" + Date.now();
         chatModel.clear();
+        root.resetHistVersion();
         root.sessionsOpen = false;
         stateAdapter.lastSession = root.currentSession;
         stateFile.writeAdapter();

@@ -356,15 +356,20 @@ function runAgentStreaming(message, sessionKey, onEvent) {
 // ---- session listing + transcript reading ----------------------------------
 
 // `openclaw sessions list --json` is the ONLY way to map a session key to the
-// sessionId the transcript table is keyed by — and it costs ~2.1 s (it boots a
-// whole CLI). The panel polls /history every 3 s, so calling it per request made
-// the poll cost ~2.3 s of wall time and two process spawns per tick. It changes
-// only when a session is created or takes a turn, so memoise it: the poll now
-// spends nothing here for 30 s at a time.
+// sessionId the transcript table is keyed by — and it costs ~2.1 s, because it
+// boots a whole CLI. Calling it per request is what made /history ~2.3 s and
+// /sessions ~2.6 s, and the panel polls /history every 3 s.
+//
+// It is cached STALE-WHILE-REVALIDATE rather than with a plain TTL: a plain TTL
+// would still hand one poll tick in every TTL the full 2.1 s bill, which is not
+// "near zero", it is "near zero on average". So a caller gets whatever is
+// cached, immediately, and a stale cache schedules a refresh in the background
+// for the next caller. The only request that ever waits is the first one after
+// startup, when there is nothing to serve.
 const SESSION_INDEX_TTL_MS = parseInt(process.env.OPENCLAW_BRIDGE_INDEX_TTL_MS || '30000', 10);
 // A key the cache has never seen (a chat that was just created) must not be
-// invisible for a whole TTL, so a lookup miss may force one refresh — but no
-// more often than this, or an unknown key becomes an un-cached spawn per poll.
+// invisible until the background refresh lands, so a lookup miss DOES wait for
+// one — but no more often than this, or an unknown key costs a spawn per poll.
 const SESSION_INDEX_MISS_MS = parseInt(process.env.OPENCLAW_BRIDGE_INDEX_MISS_MS || '3000', 10);
 
 let indexCache = [];      // last successful `sessions list` result
@@ -391,35 +396,43 @@ function fetchSessionIndex() {
   });
 }
 
-// The sessions array, at most `maxAgeMs` old. Pass 0 to force a refresh.
-// A failed refresh keeps serving the previous answer rather than blanking the
-// drawer — and is not cached, so the next call retries.
-function sessionIndex(maxAgeMs = SESSION_INDEX_TTL_MS) {
-  if (indexCachedAt && Date.now() - indexCachedAt <= maxAgeMs) return Promise.resolve(indexCache);
-  if (indexInflight) return indexInflight;
-  indexInflight = fetchSessionIndex()
-    .then(list => {
-      if (list) {
-        indexCache = list;
-        indexCachedAt = Date.now();
-      }
-      return indexCache;
-    })
-    .finally(() => {
-      indexInflight = null;
-    });
+// Start (or join) a refresh. A failed one keeps serving the previous answer
+// rather than blanking the drawer, and doesn't move `indexCachedAt`, so the next
+// caller retries.
+function refreshSessionIndex() {
+  if (!indexInflight) {
+    indexInflight = fetchSessionIndex()
+      .then(list => {
+        if (list) {
+          indexCache = list;
+          indexCachedAt = Date.now();
+        }
+        return indexCache;
+      })
+      .finally(() => {
+        indexInflight = null;
+      });
+  }
   return indexInflight;
 }
 
-// Look up one session by key, refreshing a stale index at most every
-// SESSION_INDEX_MISS_MS if the key isn't in it yet. Returns null if unknown.
+// The sessions array. Never waits on the CLI once anything is cached; a stale
+// cache is served now and refreshed behind the caller's back.
+function sessionIndex(maxAgeMs = SESSION_INDEX_TTL_MS) {
+  if (indexCachedAt && Date.now() - indexCachedAt <= maxAgeMs) return Promise.resolve(indexCache);
+  const refreshing = refreshSessionIndex();
+  return indexCachedAt ? Promise.resolve(indexCache) : refreshing;
+}
+
+// Look up one session by key. Unlike sessionIndex() this DOES wait for a
+// refresh when the key is absent, so a chat created seconds ago resolves now
+// instead of after the next background refresh — rate-limited, because an
+// always-absent key would otherwise re-spawn the CLI on every poll.
 async function sessionByKey(key) {
-  let list = await sessionIndex();
-  let s = list.find(x => x.key === key);
+  let s = (await sessionIndex()).find(x => x.key === key);
   if (!s && Date.now() - indexLastMiss >= SESSION_INDEX_MISS_MS) {
     indexLastMiss = Date.now();
-    list = await sessionIndex(0);
-    s = list.find(x => x.key === key);
+    s = (await refreshSessionIndex()).find(x => x.key === key);
   }
   return s || null;
 }
@@ -656,8 +669,10 @@ const HISTORY_LIMIT_MAX = 5000;
 // rows are dropped after the read, so we need slack; on a real store ~99.9% of
 // rows survive, making 3x generous.
 const HISTORY_ROW_OVERFETCH = 3;
-// /sessions is opened by hand, not polled, so it tolerates a much fresher index
-// than /history does — a chat created seconds ago should be in the drawer.
+// /sessions is opened by hand, so it asks for a much fresher index than the
+// poll does — but still never waits for one (see sessionIndex): a drawer that
+// opens instantly and is a few seconds behind beats one that stalls 2 s every
+// time. `?fresh=1` waits, for a caller that would rather be certain.
 const SESSIONS_INDEX_MAX_AGE_MS = 5000;
 // Concurrent titleFor() reads (each is a sqlite3 spawn).
 const TITLE_POOL = 4;
@@ -731,7 +746,10 @@ const server = http.createServer((req, res) => {
   // --- recent-chats list ---
   if (req.method === 'GET' && path === '/sessions') {
     (async () => {
-      const sessions = (await sessionIndex(SESSIONS_INDEX_MAX_AGE_MS)).filter(s => isChatSession(s.key));
+      const index = url.searchParams.get('fresh')
+        ? await refreshSessionIndex()
+        : await sessionIndex(SESSIONS_INDEX_MAX_AGE_MS);
+      const sessions = index.filter(s => isChatSession(s.key));
       const list = (
         await mapPool(sessions, TITLE_POOL, async s => ({
           key: s.key,

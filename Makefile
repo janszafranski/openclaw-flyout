@@ -11,7 +11,7 @@ help:
 	@echo "OpenClaw flyout"
 	@echo "  make install     deploy panel + bridge + service into your \$$HOME, wire Super+O"
 	@echo "  make uninstall   remove everything this installed"
-	@echo "  make check       syntax-check the bridge (node) and panel (qs)"
+	@echo "  make check       syntax-check the bridge + scripts, run the unit tests"
 
 install:
 	./install.sh
@@ -23,3 +23,7 @@ uninstall:
 check:
 	@command -v node >/dev/null 2>&1 && node --check bin/openclaw-ai-bridge.js && echo "bridge: OK" || echo "bridge: node not found, skipped"
 	@command -v bash >/dev/null 2>&1 && bash -n install.sh && bash -n uninstall.sh && bash -n bin/openclaw-cli-chat.sh && echo "scripts: OK" || echo "scripts: bash not found, skipped"
+	@command -v node >/dev/null 2>&1 && node --test test/ || echo "tests: node not found, skipped"
+# shell.qml has no static check: qmllint can't resolve the Quickshell imports and
+# exits non-zero on a perfectly good file, and `qs` has no parse-only mode. The
+# panel logic worth testing is mirrored into test/ instead.
