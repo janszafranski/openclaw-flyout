@@ -64,6 +64,19 @@ if [[ ! -f "$HOME/.config/quickshell/openclaw-sidebar/shortcuts.json" \
      "$HOME/.config/quickshell/openclaw-sidebar/shortcuts.json"
 fi
 
+# --- private bridge config ----------------------------------------------------
+# title-flags.json holds personal match tokens, so it lives here and never in the
+# repo. Seed an empty default + the documented example; never clobber a real one.
+if [[ -f "$SELF/config/title-flags.json.example" ]]; then
+  mkdir -p "$HOME/.config/openclaw-flyout"
+  cp "$SELF/config/title-flags.json.example" \
+     "$HOME/.config/openclaw-flyout/title-flags.json.example"
+  if [[ ! -f "$HOME/.config/openclaw-flyout/title-flags.json" ]]; then
+    cp "$SELF/config/title-flags.json.example" \
+       "$HOME/.config/openclaw-flyout/title-flags.json"
+  fi
+fi
+
 # --- bridge service ----------------------------------------------------------
 log "Installing + enabling the bridge service"
 install -Dm644 "$SELF/systemd/openclaw-ai-bridge.service" "$HOME/.config/systemd/user/openclaw-ai-bridge.service"

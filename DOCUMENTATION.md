@@ -61,6 +61,28 @@ probe/test keys) are filtered out by `isChatSession()`. A session whose only
 content is bootstrap/harness preamble has a `null` title and is dropped too — the
 default flyout session is the one exception (always kept).
 
+**Drawer title flags.** A title can carry a prefix when one topic dominates the
+transcript, so the chat about that topic stays findable in a long drawer. The
+tokens that identify it are personal — a matter reference, a firm, a person's
+name — so they are **config, not source**, and this repo ships none:
+
+```
+~/.config/openclaw-flyout/title-flags.json     # private; OPENCLAW_FLYOUT_CONFIG_DIR
+                                               # or XDG_CONFIG_HOME relocates it
+{ "flags": [ { "prefix": "⚖", "threshold": 100, "tokens": ["…", "…"] } ] }
+```
+
+`config/title-flags.json.example` documents every field and is the empty default
+`install.sh` seeds. `loadTitleFlags()` reads the file **once at startup** — restart
+the bridge after editing it. `titleFor()` applies the first flag whose tokens hit
+`threshold` times across the whole transcript; that count is what stops a single
+passing mention in an unrelated chat from branding the whole session. Tokens are
+matched **literally** and case-insensitively, not as regexes, so nothing needs
+escaping and a malformed entry is skipped with a warning rather than taking the
+bridge down. The startup line reports a count and the path only: logging the
+tokens would put them straight back into journald, which is the same mistake as
+having them in the source.
+
 ### `GET /history?session=<key>`
 Returns `{ session, messages: [{role, content}, …] }`, already cleaned (see §1).
 
@@ -158,6 +180,8 @@ as grey lines/curves. If you change `gaps_out`, match `edgeGap` in `shell.qml`.
 bin/openclaw-ai-bridge.js        the bridge (Node)
 bin/openclaw-cli-chat.sh         ↗ CLI hand-off + reopen-on-exit
 bin/openclaw-dashboard.sh        open the Control UI with a token
+config/title-flags.json.example  drawer title-flag schema + empty default
+                                 (live copy: ~/.config/openclaw-flyout/title-flags.json)
 systemd/openclaw-ai-bridge.service  user service for the bridge
 quickshell/openclaw-sidebar/
   shell.qml                      the panel
