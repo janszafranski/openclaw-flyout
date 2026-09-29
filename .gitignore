@@ -2,6 +2,10 @@
 shortcuts.json
 *.log
 
+# private per-user config — the live copy belongs in ~/.config/openclaw-flyout,
+# never in the repo. Only the .example is tracked.
+title-flags.json
+
 # build / packaging artifacts
 *.pkg.tar.zst
 *.tar.gz

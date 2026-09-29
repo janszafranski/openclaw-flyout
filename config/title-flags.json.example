@@ -1,0 +1,28 @@
+{
+  "_doc": [
+    "Drawer-title flags for the OpenClaw flyout bridge. Copy this file to",
+    "~/.config/openclaw-flyout/title-flags.json and edit it there. It is private:",
+    "it lives outside the repo so nothing personal is ever committed.",
+    "",
+    "A flag prefixes a session's drawer title once the transcript contains at",
+    "least `threshold` matches of `tokens`, so the chat that is really ABOUT a",
+    "topic is findable while a chat that merely mentioned it once is not marked.",
+    "The first matching flag wins. Read once at bridge startup — restart the",
+    "bridge (systemctl --user restart openclaw-ai-bridge) after editing.",
+    "",
+    "prefix    string, prepended to the title. A space is added if it has no",
+    "          trailing whitespace, so both \"⚖\" and \"⚖ Matter — \" read right.",
+    "threshold number of matches required across the whole transcript. Default 1.",
+    "          Topic-dominated transcripts score in the hundreds; a passing",
+    "          mention scores tens, so ~100 is a good separator.",
+    "tokens    LITERAL, case-insensitive substrings — not regexes. Nothing needs",
+    "          escaping, and a stray bracket cannot break the bridge. List each",
+    "          spelling you want matched separately (\"acme co\", \"acme-co\")."
+  ],
+  "_example": {
+    "prefix": "⚖",
+    "threshold": 100,
+    "tokens": ["some-matter-reference", "some firm name"]
+  },
+  "flags": []
+}

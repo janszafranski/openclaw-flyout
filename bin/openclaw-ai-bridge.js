@@ -10,7 +10,16 @@
  *                              SSE deltas. Body may include "session": "<key>"
  *                              to target a session (default OPENCLAW_BRIDGE_SESSION).
  *   GET  /sessions             Recent real chats, newest first (for the drawer).
- *   GET  /history?session=<k>  Normalized, already-cleaned transcript for one session.
+ *   GET  /history?session=<k>[&limit=N]
+ *                              Normalized, already-cleaned transcript for one
+ *                              session — the NEWEST N messages (default 200,
+ *                              `limit=0`/`all` for the whole thing). Also
+ *                              returns `version`, the session's max transcript
+ *                              seq, paired with the messages it returned.
+ *   GET  /history/version?session=<k>
+ *                              Just `{session, version}` — one indexed query,
+ *                              no body. Poll this and fetch /history only when
+ *                              the number moves.
  *   GET  /v1/models            OpenAI model list (single synthetic model).
  *
  * Streaming: token-by-token via the supported ACP bridge (`openclaw acp`), with
@@ -21,11 +30,31 @@
 'use strict';
 
 const http = require('http');
-const { execFile, execFileSync, spawn } = require('child_process');
+// execFile only, never execFileSync: this process also carries in-flight SSE
+// streams, and a synchronous transcript read blocks the event loop (and so the
+// stream) for as long as it takes.
+const { execFile, spawn } = require('child_process');
+const fs = require('fs');
 const net = require('net');
 
 const HOST = '127.0.0.1';
 const PORT = parseInt(process.env.OPENCLAW_BRIDGE_PORT || '8787', 10);
+
+// Loopback-only guard. This bridge runs unauthenticated agent turns with tool
+// permissions auto-approved, so the only thing between a web page and shell
+// access on this machine is that a browser must not be able to reach it.
+// `Access-Control-Allow-Origin: *` used to hand that away: a POST to
+// /v1/chat/completions with the default `text/plain` content type is a CORS
+// *simple* request, so no preflight is sent, any page you visited could start a
+// turn, and ACAO let it read the streamed reply back. Two rules close it, and
+// no CORS header is sent anywhere any more:
+//   - a request carrying `Origin` is browser-initiated -> refuse it;
+//   - `Host` must name this loopback listener -> blocks DNS rebinding, where a
+//     hostile name resolves to 127.0.0.1 for clients CORS never covered.
+// The real client is curl/XMLHttpRequest from the QML panel: no `Origin`, and a
+// literal `127.0.0.1:<port>` Host. It is unaffected. A browser client would
+// need a shared bearer token (OPENCLAW_BRIDGE_TOKEN), not CORS.
+const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`, `[::1]:${PORT}`]);
 const DEFAULT_SESSION = process.env.OPENCLAW_BRIDGE_SESSION || 'agent:main:ai-flyout';
 const AGENT_TIMEOUT = process.env.OPENCLAW_BRIDGE_TIMEOUT || '600';
 const MODEL_ID = 'openclaw';
@@ -60,6 +89,12 @@ const ACP_WORKSPACE =
 const SESSION_DB =
   process.env.OPENCLAW_BRIDGE_SESSION_DB ||
   `${process.env.HOME || '/root'}/.openclaw/agents/main/agent/openclaw-agent.sqlite`;
+
+// Per-user config the repo must never contain. See loadTitleFlags() below and
+// config/title-flags.json.example for the one file that lives here.
+const CONFIG_DIR =
+  process.env.OPENCLAW_FLYOUT_CONFIG_DIR ||
+  `${process.env.XDG_CONFIG_HOME || `${process.env.HOME || '/root'}/.config`}/openclaw-flyout`;
 
 // ---- OpenClaw gateway auto-start -------------------------------------------
 // If a turn arrives while the gateway is down, start it (systemd --user unit
@@ -320,43 +355,126 @@ function runAgentStreaming(message, sessionKey, onEvent) {
 
 // ---- session listing + transcript reading ----------------------------------
 
-// Read `openclaw sessions list --json` once; returns the raw sessions array.
-function sessionIndex() {
+// `openclaw sessions list --json` is the ONLY way to map a session key to the
+// sessionId the transcript table is keyed by — and it costs ~2.1 s (it boots a
+// whole CLI). The panel polls /history every 3 s, so calling it per request made
+// the poll cost ~2.3 s of wall time and two process spawns per tick. It changes
+// only when a session is created or takes a turn, so memoise it: the poll now
+// spends nothing here for 30 s at a time.
+const SESSION_INDEX_TTL_MS = parseInt(process.env.OPENCLAW_BRIDGE_INDEX_TTL_MS || '30000', 10);
+// A key the cache has never seen (a chat that was just created) must not be
+// invisible for a whole TTL, so a lookup miss may force one refresh — but no
+// more often than this, or an unknown key becomes an un-cached spawn per poll.
+const SESSION_INDEX_MISS_MS = parseInt(process.env.OPENCLAW_BRIDGE_INDEX_MISS_MS || '3000', 10);
+
+let indexCache = [];      // last successful `sessions list` result
+let indexCachedAt = 0;    // 0 = nothing cached yet
+let indexInflight = null; // de-dupes concurrent refreshes onto one spawn
+let indexLastMiss = 0;
+
+function fetchSessionIndex() {
   return new Promise(resolve => {
     execFile(
       'openclaw',
       ['sessions', 'list', '--json', '--limit', '200'],
       { maxBuffer: 16 * 1024 * 1024 },
       (err, stdout) => {
-        if (err || !stdout) return resolve([]);
+        if (err || !stdout) return resolve(null);
         try {
           const d = JSON.parse(stdout);
-          resolve(Array.isArray(d.sessions) ? d.sessions : []);
+          resolve(Array.isArray(d.sessions) ? d.sessions : null);
         } catch (e) {
-          resolve([]);
+          resolve(null);
         }
       }
     );
   });
 }
 
-// Fetch the raw newline-joined event_json rows for one sessionId, in order.
-// -readonly so a concurrent gateway write never blocks/corrupts the read.
-function transcriptRaw(sessionId) {
-  if (!sessionId) return '';
-  try {
-    return execFileSync(
-      'sqlite3',
-      [
-        '-readonly',
-        SESSION_DB,
-        `SELECT event_json FROM transcript_events WHERE session_id='${String(sessionId).replace(/'/g, "''")}' ORDER BY seq;`,
-      ],
-      { maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' }
-    );
-  } catch (e) {
-    return '';
+// The sessions array, at most `maxAgeMs` old. Pass 0 to force a refresh.
+// A failed refresh keeps serving the previous answer rather than blanking the
+// drawer — and is not cached, so the next call retries.
+function sessionIndex(maxAgeMs = SESSION_INDEX_TTL_MS) {
+  if (indexCachedAt && Date.now() - indexCachedAt <= maxAgeMs) return Promise.resolve(indexCache);
+  if (indexInflight) return indexInflight;
+  indexInflight = fetchSessionIndex()
+    .then(list => {
+      if (list) {
+        indexCache = list;
+        indexCachedAt = Date.now();
+      }
+      return indexCache;
+    })
+    .finally(() => {
+      indexInflight = null;
+    });
+  return indexInflight;
+}
+
+// Look up one session by key, refreshing a stale index at most every
+// SESSION_INDEX_MISS_MS if the key isn't in it yet. Returns null if unknown.
+async function sessionByKey(key) {
+  let list = await sessionIndex();
+  let s = list.find(x => x.key === key);
+  if (!s && Date.now() - indexLastMiss >= SESSION_INDEX_MISS_MS) {
+    indexLastMiss = Date.now();
+    list = await sessionIndex(0);
+    s = list.find(x => x.key === key);
   }
+  return s || null;
+}
+
+// Run one `sqlite3 -readonly` query, off the event loop. -readonly so a
+// concurrent gateway write never blocks/corrupts the read. Returns '' on any
+// failure — a transcript we can't read is an empty transcript, not a 500.
+function sqliteQuery(sql) {
+  return new Promise(resolve => {
+    execFile(
+      'sqlite3',
+      ['-readonly', SESSION_DB, sql],
+      { maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
+      (err, stdout) => resolve(err ? '' : stdout)
+    );
+  });
+}
+
+// sessionId comes from OpenClaw's own output, but quote it properly regardless.
+const sqlStr = s => `'${String(s).replace(/'/g, "''")}'`;
+
+// Fetch raw newline-joined event_json rows for one sessionId, oldest-first.
+// `rows > 0` reads only the NEWEST `rows` of them (`ORDER BY seq DESC LIMIT`,
+// re-sorted ascending) — the transcript table is keyed (session_id, seq), so
+// that's an index range scan, not a table scan. `head` reads the OLDEST `rows`
+// instead, which is all a title needs.
+// Resolves {version, raw}: `version` is the session's max seq, read in the same
+// sqlite3 invocation so it can never disagree with the rows returned.
+// sqlite3 emits one line per row (JSON escapes any newline inside the value),
+// so the leading line is unambiguously the version.
+async function transcriptRead(sessionId, { rows = 0, head = false } = {}) {
+  if (!sessionId) return { version: -1, raw: '' };
+  const id = sqlStr(sessionId);
+  const select =
+    rows > 0 && !head
+      ? `SELECT event_json FROM (SELECT seq, event_json FROM transcript_events WHERE session_id=${id} ORDER BY seq DESC LIMIT ${rows}) ORDER BY seq;`
+      : `SELECT event_json FROM transcript_events WHERE session_id=${id} ORDER BY seq${rows > 0 ? ` LIMIT ${rows}` : ''};`;
+  const out = await sqliteQuery(
+    `SELECT COALESCE(MAX(seq), -1) FROM transcript_events WHERE session_id=${id};\n${select}`
+  );
+  const nl = out.indexOf('\n');
+  if (nl < 0) return { version: -1, raw: '' };
+  const version = parseInt(out.slice(0, nl), 10);
+  return { version: Number.isFinite(version) ? version : -1, raw: out.slice(nl + 1) };
+}
+
+// The session's max transcript seq, or -1. One indexed query, no body — this is
+// what makes the panel's poll conditional.
+async function transcriptVersion(sessionId) {
+  if (!sessionId) return -1;
+  const out = await sqliteQuery(
+    `SELECT COALESCE(MAX(seq), -1) FROM transcript_events WHERE session_id=${sqlStr(sessionId)};`
+  );
+  const v = parseInt(String(out).trim(), 10);
+  return Number.isFinite(v) ? v : -1;
 }
 
 // Parse a transcript (raw newline-delimited event JSON) into display-ready
@@ -387,26 +505,131 @@ function parseTranscript(raw) {
   return out;
 }
 
-// Derive a drawer title from the first genuinely human user message.
-// Strong Ladywell-case tokens. We flag the drawer title with a scales prefix
-// only when the case is a SUBSTANTIAL topic — a single passing mention (e.g. a
-// Home-Assistant chat that referenced it once) must not brand the whole session.
-// So we count distinct token hits and require a threshold.
-const CASE_TOKENS = /ladywell|brethertons|jenner-?group|N60YX353|230743|mweston|matt weston|defence and counterclaim|counterclaim|freeholder|section 22|service charge|forfeiture/gi;
+// ---- drawer title flags ----------------------------------------------------
+// A drawer title can carry a prefix when one topic *dominates* a transcript, so
+// the chat about that topic is findable at a glance. The tokens that identify
+// the topic are personal — a matter reference, a firm, a person's name — so they
+// live in a file this repo never ships and git never sees:
+//
+//   ~/.config/openclaw-flyout/title-flags.json       (OPENCLAW_FLYOUT_CONFIG_DIR
+//                                                     or XDG_CONFIG_HOME to move it)
+//   { "flags": [ { "prefix": "⚖", "threshold": 100, "tokens": ["…", "…"] } ] }
+//
+// The shipped default is no flags at all; see config/title-flags.json.example.
+// Tokens are matched literally and case-insensitively, NOT as regexes, so
+// nothing needs escaping and a stray `(` in your config cannot kill the bridge.
+// `threshold` is how many matches the whole transcript must contain before the
+// prefix applies (default 1) — the point being that one passing mention in an
+// unrelated chat must not brand that whole session. For scale: on a real store,
+// transcripts genuinely *about* a topic scored 300-1100+ hits while incidental
+// mentions stayed under ~170, so a threshold around 100 separates them.
+const TITLE_FLAGS_FILE = `${CONFIG_DIR}/title-flags.json`;
 
-function titleFor(sessionId) {
-  const raw = transcriptRaw(sessionId);
-  const msgs = parseTranscript(raw);
-  const firstUser = msgs.find(m => m.role === 'user');
-  if (!firstUser) return null;
-  let title = firstUser.content.replace(/\s+/g, ' ').slice(0, 60);
-  // Count case-token hits across the transcript. Observed distribution: the
-  // case-dominated chats score 300-1100+, incidental mentions score <=170.
-  // >=100 flags only sessions where Ladywell is the dominant topic, so the flag
-  // stays useful for finding *the* legal chat. Tunable if it under/over-flags.
-  const hits = (raw.match(CASE_TOKENS) || []).length;
-  if (hits >= 100) title = '⚖ Ladywell — ' + title;
+const reEscape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Parse title-flags.json into [{prefix, threshold, re}]. Never throws: bad
+// config degrades to fewer flags, because an unreadable preference is not a
+// reason to take the panel's data layer down.
+function loadTitleFlags() {
+  let text = null;
+  try {
+    text = fs.readFileSync(TITLE_FLAGS_FILE, 'utf8');
+  } catch (e) {
+    // Absent is the shipped default, not a problem worth a warning.
+    if (e.code !== 'ENOENT') console.error('[bridge] title-flags unreadable:', firstLine(e));
+  }
+  let parsed = null;
+  if (text !== null) {
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      console.error('[bridge] title-flags is not valid JSON, ignoring it:', firstLine(e));
+    }
+  }
+  const entries = Array.isArray(parsed && parsed.flags) ? parsed.flags : [];
+  const flags = [];
+  entries.forEach((f, i) => {
+    const tokens = Array.isArray(f && f.tokens)
+      ? f.tokens.filter(t => typeof t === 'string' && t.trim() !== '')
+      : [];
+    let prefix = f && typeof f.prefix === 'string' ? f.prefix : '';
+    if (!tokens.length || !prefix) {
+      console.error(`[bridge] title-flags[${i}] needs a prefix and at least one token — skipped`);
+      return;
+    }
+    // "⚖" and "⚖ Matter — " should both read correctly once prepended.
+    if (!/\s$/.test(prefix)) prefix += ' ';
+    const threshold =
+      typeof f.threshold === 'number' && f.threshold >= 1 ? Math.floor(f.threshold) : 1;
+    flags.push({ prefix, threshold, re: new RegExp(tokens.map(reEscape).join('|'), 'gi') });
+  });
+  // Count only. Logging the tokens would put them back in journald, which is
+  // the same mistake as having them in the source.
+  console.log(
+    flags.length
+      ? `[bridge] title flags: ${flags.length} loaded from ${TITLE_FLAGS_FILE}`
+      : `[bridge] title flags: none (${TITLE_FLAGS_FILE})`
+  );
+  return flags;
+}
+
+// Read once at startup; restart the bridge to pick up an edit.
+const TITLE_FLAGS = loadTitleFlags();
+
+// A title comes from the FIRST human message, so with no flags configured there
+// is no reason to read past the first handful of rows — the old full-transcript
+// read was 4.3 MB per session per /sessions call, done synchronously. A flag,
+// though, is a whole-transcript property (it asks whether a topic *dominates*),
+// so a configured flag still costs one full read — but only on a cache miss.
+const TITLE_HEAD_ROWS = parseInt(process.env.OPENCLAW_BRIDGE_TITLE_HEAD_ROWS || '40', 10);
+
+// sessionId -> {updatedAt, title}. A transcript is append-only, and `updatedAt`
+// moves whenever it grows, so a hit is exact rather than merely fresh.
+const titleCache = new Map();
+const TITLE_CACHE_MAX = 500;
+
+// Derive a drawer title from the first genuinely human user message, prefixed by
+// the first configured flag whose tokens dominate the transcript.
+async function titleFor(sessionId, updatedAt) {
+  if (!sessionId) return null;
+  const hit = titleCache.get(sessionId);
+  if (hit && hit.updatedAt === updatedAt) return hit.title;
+
+  // No flags: the oldest few rows are all a title needs. Flags: the count is
+  // over the whole transcript, so read it all (once, then cached).
+  const { raw } = TITLE_FLAGS.length
+    ? await transcriptRead(sessionId)
+    : await transcriptRead(sessionId, { rows: TITLE_HEAD_ROWS, head: true });
+  const firstUser = parseTranscript(raw).find(m => m.role === 'user');
+  let title = null;
+  if (firstUser) {
+    title = firstUser.content.replace(/\s+/g, ' ').slice(0, 60);
+    const flag = TITLE_FLAGS.find(f => (raw.match(f.re) || []).length >= f.threshold);
+    if (flag) title = flag.prefix + title;
+  }
+  // A null title on a HEAD read can mean "no human message in the first N rows"
+  // rather than "no human message at all" — cache it anyway: /sessions treats
+  // null as "not a real chat", and a session whose first 40 rows are all
+  // machinery is exactly the throwaway probe that filter is there to drop.
+  if (titleCache.size >= TITLE_CACHE_MAX) titleCache.clear();
+  titleCache.set(sessionId, { updatedAt, title });
   return title;
+}
+
+// Resolve up to `width` promises at a time. /sessions maps over every chat
+// session, and each one is a process spawn; unbounded Promise.all would fork
+// the whole drawer at once.
+async function mapPool(items, width, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(width, items.length) }, worker));
+  return out;
 }
 
 // Which session keys are real, user-facing chats worth listing in the drawer.
@@ -423,10 +646,47 @@ function isChatSession(key) {
 
 // ---- HTTP helpers ----------------------------------------------------------
 
+// How many messages /history returns when the caller doesn't say. 200 is a few
+// hundred KB at most and far more than the panel can show at once; the whole
+// transcript (2601 messages / 3.45 MB on a real store) is for an archive tool,
+// not a 3-second poll.
+const HISTORY_LIMIT_DEFAULT = parseInt(process.env.OPENCLAW_BRIDGE_HISTORY_LIMIT || '200', 10);
+const HISTORY_LIMIT_MAX = 5000;
+// Raw transcript rows read per message asked for. Non-message and machinery
+// rows are dropped after the read, so we need slack; on a real store ~99.9% of
+// rows survive, making 3x generous.
+const HISTORY_ROW_OVERFETCH = 3;
+// /sessions is opened by hand, not polled, so it tolerates a much fresher index
+// than /history does — a chat created seconds ago should be in the drawer.
+const SESSIONS_INDEX_MAX_AGE_MS = 5000;
+// Concurrent titleFor() reads (each is a sqlite3 spawn).
+const TITLE_POOL = 4;
+
+// ?limit=: a positive count, or 0/"all" for the whole transcript.
+function parseLimit(raw) {
+  if (raw === null || raw === undefined || raw === '') return HISTORY_LIMIT_DEFAULT;
+  if (/^all$/i.test(raw)) return 0;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return HISTORY_LIMIT_DEFAULT;
+  return Math.min(n, HISTORY_LIMIT_MAX);
+}
+
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+  res.writeHead(code, { 'Content-Type': 'application/json' });
   res.end(body);
+}
+
+// Reason string when a request must be refused (see ALLOWED_HOSTS), else null.
+function loopbackViolation(req) {
+  if (req.headers.origin) return 'cross-origin denied';
+  if (!ALLOWED_HOSTS.has(String(req.headers.host || '').toLowerCase())) return 'bad host';
+  return null;
+}
+
+// Header values are attacker-controlled; keep them out of the log verbatim.
+function logSafe(v) {
+  return String(v || '-').replace(/[^\x20-\x7e]/g, '?').slice(0, 100);
 }
 
 function sseChunk(res, content) {
@@ -452,6 +712,15 @@ function sseStatus(res, status) {
 // ---- server ----------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
+  const denied = loopbackViolation(req);
+  if (denied) {
+    console.error(
+      `[bridge] refused ${logSafe(req.method)} (${denied}; ` +
+        `origin=${logSafe(req.headers.origin)} host=${logSafe(req.headers.host)})`
+    );
+    return sendJson(res, 403, { error: { message: denied } });
+  }
+
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const path = url.pathname;
 
@@ -461,15 +730,16 @@ const server = http.createServer((req, res) => {
 
   // --- recent-chats list ---
   if (req.method === 'GET' && path === '/sessions') {
-    sessionIndex().then(sessions => {
-      const list = sessions
-        .filter(s => isChatSession(s.key))
-        .map(s => ({
+    (async () => {
+      const sessions = (await sessionIndex(SESSIONS_INDEX_MAX_AGE_MS)).filter(s => isChatSession(s.key));
+      const list = (
+        await mapPool(sessions, TITLE_POOL, async s => ({
           key: s.key,
           updatedAt: s.updatedAt || 0,
           sessionId: s.sessionId,
-          title: titleFor(s.sessionId),
+          title: await titleFor(s.sessionId, s.updatedAt || 0),
         }))
+      )
         // A real chat has a human-authored title. title === null means the
         // session held only bootstrap/harness preamble — a throwaway probe;
         // drop it. The always-real default session is kept even if empty.
@@ -477,18 +747,48 @@ const server = http.createServer((req, res) => {
         .map(s => ({ ...s, title: s.title || s.key }))
         .sort((a, b) => b.updatedAt - a.updatedAt);
       sendJson(res, 200, { sessions: list });
-    });
+    })().catch(e => sendJson(res, 500, { error: { message: firstLine(e) } }));
+    return;
+  }
+
+  // --- cheap change check: max transcript seq, no body ---
+  // The panel polls this every few seconds and only fetches /history when the
+  // number moves, which is what takes the at-rest poll cost to ~nothing.
+  if (req.method === 'GET' && path === '/history/version') {
+    const key = url.searchParams.get('session') || DEFAULT_SESSION;
+    (async () => {
+      const s = await sessionByKey(key);
+      // An unknown key is a chat with no transcript yet, not an error: -1 is a
+      // real version that a later first turn will move off.
+      sendJson(res, 200, { session: key, version: s ? await transcriptVersion(s.sessionId) : -1 });
+    })().catch(e => sendJson(res, 500, { error: { message: firstLine(e) } }));
     return;
   }
 
   // --- transcript for one session ---
+  // ?limit=N returns the NEWEST N messages (default HISTORY_LIMIT_DEFAULT);
+  // limit=0 returns everything. Unbounded was the default, which meant a 3.45 MB
+  // body every 3 s on a long-lived chat.
   if (req.method === 'GET' && path === '/history') {
     const key = url.searchParams.get('session') || DEFAULT_SESSION;
-    sessionIndex().then(sessions => {
-      const s = sessions.find(x => x.key === key);
-      if (!s) return sendJson(res, 200, { session: key, messages: [] });
-      sendJson(res, 200, { session: key, messages: parseTranscript(transcriptRaw(s.sessionId)) });
-    });
+    const limit = parseLimit(url.searchParams.get('limit'));
+    (async () => {
+      const s = await sessionByKey(key);
+      if (!s) return sendJson(res, 200, { session: key, version: -1, limit, messages: [] });
+      // parseTranscript drops non-message and pure-machinery rows, so reading
+      // exactly `limit` rows could return fewer than `limit` messages. Overfetch
+      // rows, then trim to the newest `limit` messages.
+      const { version, raw } = await transcriptRead(s.sessionId, {
+        rows: limit ? limit * HISTORY_ROW_OVERFETCH : 0,
+      });
+      const msgs = parseTranscript(raw);
+      sendJson(res, 200, {
+        session: key,
+        version,
+        limit,
+        messages: limit && msgs.length > limit ? msgs.slice(-limit) : msgs,
+      });
+    })().catch(e => sendJson(res, 500, { error: { message: firstLine(e) } }));
     return;
   }
 
@@ -525,7 +825,6 @@ const server = http.createServer((req, res) => {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
       });
       let streamedAny = false;
       // bring OpenClaw up before attempting a turn, if needed
